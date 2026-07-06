@@ -1,0 +1,1357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cursebound: Houses of the Ancients — One-Shot Prototype</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#06060b;overflow:hidden}
+  #wrap{display:flex;align-items:center;justify-content:center;height:100%}
+  canvas{box-shadow:0 0 80px rgba(130,60,220,.28);border-radius:4px;cursor:crosshair}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="600"></canvas></div>
+<script>
+"use strict";
+/* =====================================================================
+   CURSEBOUND: HOUSES OF THE ANCIENTS — one-shot browser prototype
+   Single file, no libraries, no external assets. Everything is drawn
+   with shapes, glows and text on a 960x600 canvas.
+
+   Visual grammar (from the design bible):
+     PURPLE = interactive curse risk   RED   = danger / hunt / sealed
+     BLUE   = clue / evidence          GREEN = ward / ritual success
+
+   Core rule: bullets stagger monsters, knowledge resolves curses.
+   ===================================================================== */
+
+/* ---------------------------- constants ---------------------------- */
+const W = 960, H = 600, TILE = 40, COLS = 24, ROWS = 15;
+
+const GameState  = { TITLE:0, WORLD:1, HOUSE:2, GAME_OVER:3, WIN:4 };
+const CurseState = { DORMANT:0, OMEN:1, SEAL:2, HUNT:3, DISTORTION:4, JUDGMENT:5, RESOLVED:6 };
+const CURSE_NAME = ["DORMANT","OMEN","SEAL","HUNT","DISTORTION","JUDGMENT","RESOLVED"];
+const CURSE_COL  = ["#8a8a9a","#b070e0","#e04040","#ff3030","#c040ff","#ffd040","#40e080"];
+
+const COL = {
+  purple:"#b060ff", purpleDim:"#7040aa",
+  red:"#ff3838",    redDim:"#8a2020",
+  blue:"#50a0ff",   blueDim:"#2a5a99",
+  green:"#40e080",  greenDim:"#1f7a45",
+  bone:"#d8d2c0",   ink:"#0a0a12"
+};
+
+/* ------------------------------ utils ------------------------------ */
+const clamp = (v,a,b)=>v<a?a:(v>b?b:v);
+const dist  = (a,b)=>Math.hypot(a.x-b.x, a.y-b.y);
+const lerp  = (a,b,t)=>a+(b-a)*t;
+function mulberry32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
+function hash2(x,y){return ((x*73856093)^(y*19349663))>>>0;}
+
+/* ------------------------------ audio ------------------------------ */
+/* Tiny WebAudio helper: short synthesized cues, created on first input. */
+const Sfx = {
+  ctx:null,
+  ensure(){ if(!this.ctx){ try{ this.ctx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } },
+  tone(f,d,type,g,slide){ this.ensure(); if(!this.ctx) return;
+    const c=this.ctx,o=c.createOscillator(),v=c.createGain();
+    o.type=type||"sine"; o.frequency.value=f;
+    if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30,f+slide), c.currentTime+d);
+    v.gain.value=g||0.08; v.gain.exponentialRampToValueAtTime(0.0001,c.currentTime+d);
+    o.connect(v); v.connect(c.destination); o.start(); o.stop(c.currentTime+d); },
+  noise(d,g){ this.ensure(); if(!this.ctx) return;
+    const c=this.ctx,len=c.sampleRate*d,buf=c.createBuffer(1,len,c.sampleRate),ch=buf.getChannelData(0);
+    for(let i=0;i<len;i++) ch[i]=(Math.random()*2-1)*(1-i/len);
+    const s=c.createBufferSource(),v=c.createGain(); v.gain.value=g||0.12;
+    s.buffer=buf; s.connect(v); v.connect(c.destination); s.start(); },
+  shot(){ this.noise(0.16,0.16); this.tone(140,0.12,"square",0.05,-90); },
+  blip(){ this.tone(660,0.07,"triangle",0.06); },
+  clue(){ this.tone(520,0.25,"sine",0.07,260); },
+  curse(){ this.tone(120,0.9,"sawtooth",0.05,-70); },
+  seal(){ this.tone(70,0.7,"square",0.09,-30); this.noise(0.3,0.08); },
+  growl(){ this.tone(60,0.45,"sawtooth",0.09,25); },
+  ward(){ this.tone(392,0.5,"sine",0.06,196); },
+  ritual(){ this.tone(523,1.1,"sine",0.08,262); this.tone(659,1.1,"sine",0.05,330); },
+  hurt(){ this.tone(180,0.2,"square",0.09,-120); },
+  mimic(){ this.tone(900,0.5,"sawtooth",0.06,-700); }
+};
+
+/* --------------------------- faction data -------------------------- */
+const FACTIONS = [
+  { key:"CELTIC", name:"Celtic  ·  Order of the Black Star",
+    color:"#5fd8a0",
+    desc:["Druidic astrotech & fae thresholds.",
+          "+ Sees hidden doors & curse objects afar",
+          "+ Starter kit: extra battery cells"],
+    kit:{battery:35}, hiddenRadius:240, purpleSense:true },
+  { key:"ASSYRIAN", name:"Assyrian  ·  Star-Priests of the Ledger",
+    color:"#e0a050",
+    desc:["Cuneiform contracts & demon ledgers.",
+          "+ Identifies false clues, slows debt-hunters",
+          "+ Starter kit: bronze rounds (extra ammo)"],
+    kit:{ammo:4}, hiddenRadius:100, monsterSlow:0.85, seesFake:true },
+  { key:"EGYPTIAN", name:"Egyptian  ·  House of Duat",
+    color:"#ffd45f",
+    desc:["Funerary tech, heart scales, solar rites.",
+          "+ Greater resolve, faster judgment rituals",
+          "+ Starter kit: extra natron salt"],
+    kit:{salt:1}, hiddenRadius:100, resolveMax:130, ritualTime:3.2 }
+];
+
+/* ---------------------------- house data ---------------------------
+   Legend:  #=wall  .=floor  d=inner door  D=exit door (sealable)
+            F=furniture(loot) S=salt cache  C=real clue  X=false clue
+            T=purple trigger  W=ward circle  M=monster spawn
+            r=danger path     H=hidden door (wall until opened)
+--------------------------------------------------------------------- */
+const HOUSES = [
+  { name:"Rowan Farm", curseType:"Threshold Curse", affinity:"CELTIC",
+    trigger:"carved toy horse", monster:"The Uninvited",
+    omen:"The hearth goes cold. Something has noticed you.",
+    clueTexts:[ "Child's drawing: a black door that isn't there",
+                "Rowan branch nailed above the threshold",
+                "Diary: 'We never invited it. It came through the walls.'" ],
+    fakeClue:"Muddy bootprints... they lead nowhere. A false trail.",
+    ritual:"Guest-rite: stand in the green ward, lay the salt line, speak welcome.",
+    resolvedText:"The threshold accepts the guest-rite. Rowan Farm exhales.",
+    whispers:["...who invited you...","...the door that isn't...","...cold hearth, cold guest...","...knock, knock..."],
+    map:[
+      "########################",
+      "#.....#........#.......#",
+      "#.F.C.#..r..M..#..C..F.#",
+      "#.....#..r.....d.......#",
+      "#..S..d..r.....#...T...#",
+      "####d##..r..####H#######",
+      "#.....#..r.....#.......#",
+      "#..F..#..r.W...d...C...#",
+      "#.....#..r.....#...F...#",
+      "#..X..#..r.....#.......#",
+      "####d###..r..###########",
+      "#......................#",
+      "#..F........F.......F..#",
+      "#......................#",
+      "###########D############" ]},
+
+  { name:"Clay Ledger House", curseType:"Debt Curse", affinity:"ASSYRIAN",
+    trigger:"cracked clay tablet", monster:"The Debt-Keeper",
+    omen:"Ink crawls across the walls, tallying what you owe.",
+    clueTexts:[ "Ledger page: 'Paid in grain. Owed in years.'",
+                "Bronze scale, one pan filled with teeth",
+                "Wax seal fragment bearing a name struck out" ],
+    fakeClue:"A forged IOU — the arithmetic doesn't balance.",
+    ritual:"Balance the ledger: stand in the ward, offer salt, declare the debt paid.",
+    resolvedText:"The ledger balances. The Debt-Keeper closes its book.",
+    whispers:["...you owe...","...interest accrues...","...sign here...","...paid in years..."],
+    map:[
+      "########################",
+      "#........#.....#.......#",
+      "#..F..C..d..S..#..F.C..#",
+      "#........#.....d.......#",
+      "#####d########.#...X...#",
+      "#....#..T...#..#########",
+      "#.C..d......d..d.......#",
+      "#....#......#..#..W....#",
+      "######......#..#.......#",
+      "#rrrrd......#..#####d###",
+      "#r#..#......#..........#",
+      "#rM..########..##H##..##",
+      "#r...d.........d....F..#",
+      "#r...#.........#.......#",
+      "###########D############" ]},
+
+  { name:"Widow's Hall", curseType:"Grief / Judgment Curse", affinity:"EGYPTIAN",
+    trigger:"uncovered funeral mirror", monster:"The Mourner",
+    omen:"Every clock in the hall stops at 2:17. Someone begins to weep.",
+    clueTexts:[ "Every mirror is covered — except the one you touched",
+                "A clock stopped at 2:17, wound backwards",
+                "Widow's letter: 'Weigh my heart. I kept it heavy on purpose.'" ],
+    fakeClue:"A photograph of the family — but no one has faces.",
+    ritual:"Heart-weighing: kneel in the green ward with salt and let the scales judge.",
+    resolvedText:"The heart weighs true. The Mourner lifts her veil and is gone.",
+    whispers:["...2:17...","...weigh it...","...she still sets two plates...","...look in the glass..."],
+    map:[
+      "########################",
+      "#......#...r...#.......#",
+      "#..C...#...r.M.#...T...#",
+      "#......d...r...d.......#",
+      "#..F...#...r...#..F....#",
+      "###d####...r...####d####",
+      "#......#...r...#.......#",
+      "#..S...d...r...d...C...#",
+      "#......#...r...#...X...#",
+      "##H#####...r...#########",
+      "#......#...r...#.......#",
+      "#..F...d...W...d..C.F..#",
+      "#......#.......#.......#",
+      "#......#.......#.......#",
+      "###########D############" ]}
+];
+
+const FURN_NAMES = ["cupboard","dresser","old crate","bed frame","writing desk","shelf","chest","pantry"];
+
+/* --------------------------- world layout -------------------------- */
+const WORLD = { w:1920, h:1280 };
+const VILLAGE = {
+  safehouse:{ x:830, y:760, w:220, h:150, name:"Safehouse" },
+  houses:[
+    { x:250,  y:200, w:280, h:190, id:0 },   // Rowan Farm
+    { x:1360, y:210, w:250, h:180, id:1 },   // Clay Ledger House
+    { x:1330, y:880, w:280, h:200, id:2 }    // Widow's Hall
+  ]
+};
+// deterministic decoration
+const worldRng = mulberry32(1337);
+const TREES=[]; const CRATES=[]; const ROCKS=[];
+(function genWorld(){
+  const blocked=(x,y)=>{
+    const all=[VILLAGE.safehouse,...VILLAGE.houses];
+    return all.some(h=>x>h.x-70&&x<h.x+h.w+70&&y>h.y-70&&y<h.y+h.h+90);
+  };
+  for(let i=0;i<46;i++){ const x=60+worldRng()*(WORLD.w-120), y=60+worldRng()*(WORLD.h-120);
+    if(!blocked(x,y)) TREES.push({x,y,r:12+worldRng()*10}); }
+  for(let i=0;i<14;i++){ const x=120+worldRng()*(WORLD.w-240), y=120+worldRng()*(WORLD.h-240);
+    if(!blocked(x,y)) ROCKS.push({x,y,r:8+worldRng()*8}); }
+  const kinds=["food","water","ammo","battery","salt","food","water","ammo","battery","food","water","salt"];
+  let placed=0, guard=0;
+  while(placed<kinds.length && guard++<400){
+    const x=140+worldRng()*(WORLD.w-280), y=140+worldRng()*(WORLD.h-280);
+    if(!blocked(x,y) && !TREES.some(t=>Math.hypot(t.x-x,t.y-y)<40)){
+      CRATES.push({x,y,kind:kinds[placed],taken:false}); placed++;
+    }
+  }
+})();
+
+/* ------------------------------ input ------------------------------ */
+const keys={}; const mouse={x:W/2,y:H/2,down:false};
+const canvas=document.getElementById("game"), ctx=canvas.getContext("2d");
+function fitCanvas(){
+  const s=Math.min(window.innerWidth/W, window.innerHeight/H);
+  canvas.style.width=(W*s)+"px"; canvas.style.height=(H*s)+"px";
+}
+window.addEventListener("resize",fitCanvas); fitCanvas();
+canvas.addEventListener("mousemove",e=>{
+  const r=canvas.getBoundingClientRect();
+  mouse.x=(e.clientX-r.left)*(W/r.width); mouse.y=(e.clientY-r.top)*(H/r.height);
+});
+canvas.addEventListener("mousedown",e=>{ Sfx.ensure(); mouse.down=true;
+  if(G.state===GameState.TITLE) startGame(); else tryShoot(); });
+canvas.addEventListener("mouseup",()=>mouse.down=false);
+window.addEventListener("keydown",e=>{
+  const k=e.key.toLowerCase();
+  if(["arrowup","arrowdown","arrowleft","arrowright"," "].includes(e.key.toLowerCase())||e.key===" ") e.preventDefault();
+  if(keys[k]) return void(keys[k]=true);
+  keys[k]=true; Sfx.ensure();
+  if(G.state===GameState.TITLE){
+    if(k==="1"||k==="2"||k==="3"){ G.factionIdx=+k-1; Sfx.blip(); }
+    if(k==="enter"||k==="e") startGame();
+  }else{
+    if(k==="e") interact();
+    if(k==="f"){ G.flashlight=!G.flashlight; Sfx.blip(); }
+    if(k==="n"){ G.night=!G.night; G.log(G.night?"Night falls. The purple light deepens.":"Daybreak. The curses grow subtle.", G.night?COL.purple:"#ccc"); }
+    if(k==="m"){ G.showMap=!G.showMap; }
+    if(k===" ") tryShoot();
+  }
+  if(k==="r") resetGame();
+});
+window.addEventListener("keyup",e=>keys[e.key.toLowerCase()]=false);
+
+/* --------------------------- game object --------------------------- */
+let G=null;
+function resetGame(){
+  G={
+    state:GameState.TITLE, factionIdx:0, time:0, night:false,
+    flashlight:false, showMap:false, shake:0, dmgFlash:0, greenFlash:0,
+    cam:{x:0,y:0},
+    player:{ x:VILLAGE.safehouse.x+110, y:VILLAGE.safehouse.y+220, r:12, aim:0,
+             hp:100, hpMax:100, sta:100, res:100, resMax:100,
+             hunger:0, thirst:0, battery:100, batteryMax:100,
+             inv:{food:2,water:2,ammo:6,salt:1}, hitCd:0, shotCd:0 },
+    mates:[ {name:"Bren",  x:0,y:0,r:9, distract:0,target:null, farT:0},
+            {name:"Sahar", x:0,y:0,r:9, distract:0,target:null, farT:0} ],
+    bullets:[], whispers:[], logs:[],
+    houseIdx:-1, house:null, houseInst:[null,null,null], resolvedCount:0,
+    mimicCd:8, channel:0, channeling:false,
+    stats:{shots:0, clues:0, mimics:0},
+    overCause:"",
+    log(text,color){ this.logs.push({text,color:color||COL.bone,t:0}); if(this.logs.length>6)this.logs.shift(); }
+  };
+  G.mates[0].x=G.player.x-30; G.mates[0].y=G.player.y+18;
+  G.mates[1].x=G.player.x+30; G.mates[1].y=G.player.y+18;
+}
+resetGame();
+
+function faction(){ return FACTIONS[G.factionIdx]; }
+
+function startGame(){
+  const f=faction();
+  const p=G.player;
+  p.resMax = f.resolveMax||100; p.res=p.resMax;
+  if(f.kit.ammo) p.inv.ammo+=f.kit.ammo;
+  if(f.kit.salt) p.inv.salt+=f.kit.salt;
+  if(f.kit.battery) p.battery=clamp(p.battery+f.kit.battery,0,135), p.batteryMax=135;
+  G.state=GameState.WORLD;
+  G.log("You arrive at the exclusion zone as "+f.name.split("·")[0].trim()+".", f.color);
+  G.log("Three houses hold curses. Resolve all three.", COL.purple);
+  G.log("Tip: purple objects wake curses. Knowledge, not bullets, ends them.", "#999");
+}
+
+/* -------------------------- house instance ------------------------- */
+function makeHouseInstance(id){
+  const def=HOUSES[id];
+  const tiles=def.map.map(r=>r.split(""));
+  const inst={ id, def, tiles, curse:CurseState.DORMANT, curseT:0,
+    clues:[], furniture:[], salts:[], hidden:[], danger:[],
+    trigger:null, ward:null, mSpawn:null, exit:null,
+    cluesFound:0, monster:null, mimic:null, resolved:false,
+    whisperT:3, preState:CurseState.HUNT };
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    const ch=tiles[r][c], x=c*TILE+TILE/2, y=r*TILE+TILE/2;
+    switch(ch){
+      case "C": inst.clues.push({x,y,fake:false,taken:false,idx:inst.clues.filter(q=>!q.fake).length}); tiles[r][c]="."; break;
+      case "X": inst.clues.push({x,y,fake:true,taken:false}); tiles[r][c]="."; break;
+      case "F": inst.furniture.push({x,y,c,r,looted:false,kind:FURN_NAMES[hash2(c,r)%FURN_NAMES.length]}); tiles[r][c]="."; break;
+      case "S": inst.salts.push({x,y,taken:false}); tiles[r][c]="."; break;
+      case "T": inst.trigger={x,y,used:false}; tiles[r][c]="."; break;
+      case "W": inst.ward={x,y,r:64}; tiles[r][c]="."; break;
+      case "M": inst.mSpawn={x,y}; tiles[r][c]="."; break;
+      case "H": inst.hidden.push({c,r,opened:false}); break;
+      case "D": inst.exit={c,r,sealed:false}; break;
+      case "r": inst.danger.push({c,r}); tiles[r][c]="."; break;
+    }
+  }
+  return inst;
+}
+function tileSolid(inst,c,r){
+  if(c<0||r<0||c>=COLS||r>=ROWS) return true;
+  const ch=inst.tiles[r][c];
+  if(ch==="#") return true;
+  if(ch==="H") return !inst.hidden.find(h=>h.c===c&&h.r===r)?true:!inst.hidden.find(h=>h.c===c&&h.r===r).opened;
+  if(ch==="D") return inst.exit.sealed;
+  return false;
+}
+function houseCollide(inst,x,y,rad){
+  const c0=Math.floor((x-rad)/TILE), c1=Math.floor((x+rad)/TILE);
+  const r0=Math.floor((y-rad)/TILE), r1=Math.floor((y+rad)/TILE);
+  for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++){
+    if(tileSolid(inst,c,r)){
+      const rx=c*TILE, ry=r*TILE;
+      const nx=clamp(x,rx,rx+TILE), ny=clamp(y,ry,ry+TILE);
+      if(Math.hypot(x-nx,y-ny)<rad) return true;
+    }
+  }
+  return false;
+}
+/* world collision: building rects + trees/rocks */
+function worldCollide(x,y,rad){
+  if(x<rad||y<rad||x>WORLD.w-rad||y>WORLD.h-rad) return true;
+  const rects=[VILLAGE.safehouse,...VILLAGE.houses];
+  for(const h of rects){
+    const nx=clamp(x,h.x,h.x+h.w), ny=clamp(y,h.y,h.y+h.h);
+    if(Math.hypot(x-nx,y-ny)<rad) return true;
+  }
+  for(const t of TREES) if(Math.hypot(t.x-x,t.y-y)<rad+t.r*0.55) return true;
+  for(const t of ROCKS) if(Math.hypot(t.x-x,t.y-y)<rad+t.r*0.7) return true;
+  return false;
+}
+function moveEntity(ent,dx,dy,inHouse){
+  const coll = inHouse ? (x,y)=>houseCollide(G.house,x,y,ent.r) : (x,y)=>worldCollide(x,y,ent.r);
+  if(dx&&!coll(ent.x+dx,ent.y)) ent.x+=dx;
+  if(dy&&!coll(ent.x,ent.y+dy)) ent.y+=dy;
+}
+
+/* ----------------------------- shooting ---------------------------- */
+function tryShoot(){
+  if(G.state!==GameState.WORLD&&G.state!==GameState.HOUSE) return;
+  const p=G.player;
+  if(p.shotCd>0) return;
+  if(p.inv.ammo<=0){ G.log("Click. No ammunition.", "#888"); p.shotCd=0.3; return; }
+  p.inv.ammo--; p.shotCd=0.22; G.stats.shots++;
+  const a=p.aim;
+  G.bullets.push({x:p.x+Math.cos(a)*16,y:p.y+Math.sin(a)*16,dx:Math.cos(a)*540,dy:Math.sin(a)*540,life:1.1});
+  G.shake=Math.max(G.shake,3); Sfx.shot();
+  if(G.channeling){ G.channeling=false; G.channel=0; G.log("The gunshot shatters your ritual focus.", COL.red); }
+}
+
+/* ---------------------------- interaction -------------------------- */
+function nearestInteractable(){
+  const p=G.player, R=46;
+  if(G.state===GameState.WORLD){
+    // house doors
+    for(const h of VILLAGE.houses){
+      const d={x:h.x+h.w/2,y:h.y+h.h+10};
+      if(dist(p,d)<R+14){
+        const def=HOUSES[h.id], inst=G.houseInst[h.id];
+        if(inst&&inst.resolved) return {type:"resolvedHouse", label:def.name+" is quiet now", h};
+        return {type:"enterHouse", label:"Enter "+def.name, h};
+      }
+    }
+    const s=VILLAGE.safehouse, sd={x:s.x+s.w/2,y:s.y+s.h+10};
+    if(dist(p,sd)<R+14) return {type:"rest", label:"Rest & eat at the Safehouse (1 food, 1 water)"};
+    for(const c of CRATES) if(!c.taken&&dist(p,c)<R) return {type:"crate", label:"Open supply crate", c};
+    return null;
+  }
+  if(G.state===GameState.HOUSE){
+    const inst=G.house;
+    // exit
+    const ex={x:inst.exit.c*TILE+TILE/2,y:inst.exit.r*TILE+TILE/2};
+    if(dist(p,ex)<R+16){
+      if(inst.exit.sealed) return {type:"sealed", label:"The door is SEALED by the curse"};
+      return {type:"exit", label:"Leave "+inst.def.name};
+    }
+    // hidden doors
+    for(const hd of inst.hidden){
+      if(hd.opened) continue;
+      const hx=hd.c*TILE+TILE/2, hy=hd.r*TILE+TILE/2;
+      if(dist(p,{x:hx,y:hy})<R+12 && G.hiddenSeen) return {type:"hidden", label:"Force the hidden door", hd};
+    }
+    // ward ritual
+    if(inst.ward&&dist(p,inst.ward)<inst.ward.r&&inst.curse>=CurseState.SEAL&&inst.curse<CurseState.RESOLVED){
+      if(inst.cluesFound>=3&&p.inv.salt>=1) return {type:"ritual", label:"Perform the ritual (hold your ground!)"};
+      if(inst.cluesFound<3) return {type:"noritual", label:"The ward hums… you need "+(3-inst.cluesFound)+" more clue(s)"};
+      return {type:"noritual", label:"The ward hums… you need salt for the rite"};
+    }
+    // clues (visible after OMEN)
+    if(inst.curse>=CurseState.OMEN){
+      for(const cl of inst.clues) if(!cl.taken&&dist(p,cl)<R)
+        return {type:"clue", label:cl.fake&&faction().seesFake?"Examine clue (FORGED — Assyrian eye)":"Examine clue", cl};
+    }
+    // trigger
+    if(inst.trigger&&!inst.trigger.used&&dist(p,inst.trigger)<R)
+      return {type:"trigger", label:"Touch the "+inst.def.trigger+"  ⚠ CURSE RISK", t:inst.trigger};
+    // salt
+    for(const s of inst.salts) if(!s.taken&&dist(p,s)<R) return {type:"salt", label:"Take the salt cache", s};
+    // furniture
+    for(const f of inst.furniture) if(!f.looted&&dist(p,f)<R) return {type:"furn", label:"Search the "+f.kind, f};
+    return null;
+  }
+  return null;
+}
+function interact(){
+  const it=nearestInteractable(); if(!it) return;
+  const p=G.player, inst=G.house;
+  switch(it.type){
+    case "enterHouse": enterHouse(it.h.id); break;
+    case "rest":
+      if(p.inv.food>=1&&p.inv.water>=1){
+        p.inv.food--; p.inv.water--;
+        p.hp=clamp(p.hp+50,0,p.hpMax); p.sta=100; p.res=clamp(p.res+30,0,p.resMax);
+        p.hunger=clamp(p.hunger-60,0,100); p.thirst=clamp(p.thirst-60,0,100);
+        G.log("You rest at the safehouse. Wounds close, nerves settle.", COL.green); Sfx.ward();
+      } else G.log("You need 1 food and 1 water to rest.", "#aaa");
+      break;
+    case "crate":{
+      it.c.taken=true; const k=it.c.kind;
+      if(k==="battery"){ p.battery=clamp(p.battery+40,0,p.batteryMax); G.log("Crate: battery cells (+40 charge).", COL.bone); }
+      else { p.inv[k]=(p.inv[k]||0)+(k==="ammo"?5:1); G.log("Crate: "+(k==="ammo"?"5 rounds":"1 "+k)+".", COL.bone); }
+      Sfx.blip(); break; }
+    case "exit": exitHouse(); break;
+    case "sealed": G.log("Sealed. The house wants the rite, not the handle.", COL.red); Sfx.growl(); break;
+    case "hidden":
+      it.hd.opened=true; G.log("Stone grinds aside — a hidden passage opens.", faction().color); Sfx.seal(); break;
+    case "trigger":
+      it.t.used=true; setCurse(inst,CurseState.OMEN);
+      break;
+    case "clue":{
+      const cl=it.cl; cl.taken=true;
+      if(cl.fake){
+        if(faction().seesFake){ G.log("Forged clue identified and discarded. (Assyrian training)", faction().color); Sfx.blip(); }
+        else { p.res=clamp(p.res-10,0,p.resMax); G.log(inst.def.fakeClue+"  (−10 resolve)", COL.red); Sfx.mimic(); }
+      } else {
+        inst.cluesFound++; G.stats.clues++;
+        let bonus="";
+        if(faction().key===inst.def.affinity){ p.res=clamp(p.res+6,0,p.resMax); bonus="  (+6 resolve — your order knows this curse)"; }
+        G.log("CLUE "+inst.cluesFound+"/3: "+inst.def.clueTexts[cl.idx]+bonus, COL.blue); Sfx.clue();
+        if(inst.cluesFound===3) G.log("You understand the curse. Reach the GREEN ward and press E.", COL.green);
+      }
+      break; }
+    case "salt": it.s.taken=true; p.inv.salt++; G.log("Salt cache taken. Old, dry, still holy.", COL.bone); Sfx.blip(); break;
+    case "furn":{
+      it.f.looted=true;
+      const roll=Math.random();
+      if(roll<0.28){ p.inv.food++; G.log("Found canned food in the "+it.f.kind+".", COL.bone); }
+      else if(roll<0.52){ p.inv.water++; G.log("Found clean water in the "+it.f.kind+".", COL.bone); }
+      else if(roll<0.72){ p.inv.ammo+=3; G.log("Found 3 rounds in the "+it.f.kind+".", COL.bone); }
+      else if(roll<0.87){ p.battery=clamp(p.battery+25,0,p.batteryMax); G.log("Found battery cells in the "+it.f.kind+".", COL.bone); }
+      else G.log("Nothing but dust and a family photograph.", "#888");
+      Sfx.blip(); break; }
+    case "ritual": beginRitual(); break;
+    case "noritual": G.log(it.label, COL.green); break;
+    case "resolvedHouse": G.log(it.label+".", COL.green); break;
+  }
+}
+
+function enterHouse(id){
+  if(!G.houseInst[id]) G.houseInst[id]=makeHouseInstance(id);
+  G.houseIdx=id; G.house=G.houseInst[id];
+  const inst=G.house;
+  G.state=GameState.HOUSE;
+  const p=G.player;
+  p.x=inst.exit.c*TILE+TILE/2; p.y=(inst.exit.r-1)*TILE+TILE/2;
+  G.mates.forEach((m,i)=>{ m.x=p.x+(i? -26:26); m.y=p.y+10; m.distract=0; m.target=null; m.farT=0; });
+  G.bullets.length=0;
+  G.log("You enter "+inst.def.name+" — "+inst.def.curseType+".", COL.purple);
+  if(faction().key===inst.def.affinity) G.log("Your order knows this curse. You feel prepared.", faction().color);
+}
+function exitHouse(){
+  const inst=G.house;
+  if(inst.curse===CurseState.OMEN){
+    // fleeing before the seal: the curse settles back down
+    setCurse(inst,CurseState.DORMANT); inst.trigger.used=false;
+    G.log("You flee before it fully wakes. The "+inst.def.trigger+" dims again.", "#999");
+  }
+  G.state=GameState.WORLD; G.house=null; G.houseIdx=-1; G.bullets.length=0;
+  const h=VILLAGE.houses.find(v=>v.id===inst.id);
+  G.player.x=h.x+h.w/2; G.player.y=h.y+h.h+34;
+  G.mates.forEach((m,i)=>{ m.x=G.player.x+(i?-28:28); m.y=G.player.y+16; m.target=null; });
+  if(G.resolvedCount>=3) G.state=GameState.WIN;
+}
+
+function setCurse(inst,st){
+  inst.curse=st; inst.curseT=0;
+  switch(st){
+    case CurseState.OMEN:
+      G.log(inst.def.omen, COL.purple); Sfx.curse(); G.shake=6; break;
+    case CurseState.SEAL:
+      inst.exit.sealed=true;
+      G.log("THE DOORS SEAL SHUT. The house is the arena now.", COL.red); Sfx.seal(); G.shake=8; break;
+    case CurseState.HUNT:
+      if(!inst.monster) inst.monster={x:inst.mSpawn.x,y:inst.mSpawn.y,r:15,stagger:0,hitCd:0,wob:0};
+      G.log(inst.def.monster+" begins to hunt. Bullets stagger it — clues end it.", COL.red); Sfx.growl(); break;
+    case CurseState.DISTORTION:
+      G.log("DISTORTION — the rooms lie, the map lies, your friends may lie.", "#c040ff"); Sfx.curse(); break;
+    case CurseState.JUDGMENT:
+      G.log("JUDGMENT — hold the ward. Do not move. Do not shoot.", "#ffd040"); Sfx.ritual(); break;
+    case CurseState.RESOLVED:{
+      inst.resolved=true; inst.exit.sealed=false; inst.monster=null; inst.mimic=null;
+      G.resolvedCount++;
+      const p=G.player;
+      p.inv.food+=2; p.inv.water+=2; p.inv.ammo+=6; p.inv.salt+=1;
+      p.res=clamp(p.res+40,0,p.resMax);
+      G.greenFlash=1;
+      G.log(inst.def.resolvedText, COL.green);
+      G.log("House cache unlocked: +2 food, +2 water, +6 ammo, +1 salt.", COL.green);
+      G.log("Houses resolved: "+G.resolvedCount+"/3.", COL.green);
+      Sfx.ritual(); break; }
+  }
+}
+
+function beginRitual(){
+  const inst=G.house;
+  if(inst.curse===CurseState.JUDGMENT) return;
+  inst.preState=inst.curse;
+  setCurse(inst,CurseState.JUDGMENT);
+  G.channeling=true; G.channel=0;
+}
+
+/* ------------------------------ update ----------------------------- */
+let last=performance.now();
+function update(dt){
+  G.time+=dt;
+  G.shake=Math.max(0,G.shake-dt*20);
+  G.dmgFlash=Math.max(0,G.dmgFlash-dt*1.6);
+  G.greenFlash=Math.max(0,G.greenFlash-dt*0.7);
+  if(G.state===GameState.TITLE||G.state===GameState.GAME_OVER||G.state===GameState.WIN) return;
+
+  const p=G.player, inHouse=G.state===GameState.HOUSE, inst=G.house;
+  p.shotCd=Math.max(0,p.shotCd-dt); p.hitCd=Math.max(0,p.hitCd-dt);
+
+  /* --- movement --- */
+  let dx=(keys["d"]||keys["arrowright"]?1:0)-(keys["a"]||keys["arrowleft"]?1:0);
+  let dy=(keys["s"]||keys["arrowdown"]?1:0)-(keys["w"]||keys["arrowup"]?1:0);
+  const sprinting=(keys["shift"])&&p.sta>1&&(dx||dy);
+  let spd=sprinting?240:150;
+  if(G.channeling) spd=0;
+  if(dx&&dy){dx*=0.7071;dy*=0.7071;}
+  if(inHouse&&inst.curse>=CurseState.HUNT&&inst.danger.some(t=>Math.floor(p.x/TILE)===t.c&&Math.floor(p.y/TILE)===t.r)){
+    spd*=0.8; p.res=clamp(p.res-2*dt,0,p.resMax); // curse-soaked floor
+  }
+  if(dx||dy){
+    moveEntity(p,dx*spd*dt,dy*spd*dt,inHouse);
+    if(G.channeling){ G.channeling=false; G.channel=0; G.log("You step out of the rite. The ward dims.", COL.red); }
+  }
+  p.sta=clamp(p.sta+(sprinting?-25:15)*dt,0,100);
+
+  /* --- aim --- */
+  p.aim=Math.atan2(mouse.y+G.cam.y-p.y, mouse.x+G.cam.x-p.x);
+
+  /* --- needs --- */
+  p.hunger=clamp(p.hunger+0.22*dt,0,100);
+  p.thirst=clamp(p.thirst+0.28*dt,0,100);
+  if(p.hunger>=85&&p.inv.food>0){ p.inv.food--; p.hunger-=55; G.log("You wolf down a ration.", COL.bone); }
+  if(p.thirst>=85&&p.inv.water>0){ p.inv.water--; p.thirst-=55; G.log("You drink deep.", COL.bone); }
+  if(p.hunger>=100) p.hp-=1.2*dt;
+  if(p.thirst>=100) p.hp-=1.6*dt;
+  if(G.flashlight){ p.battery=clamp(p.battery-1.2*dt,0,p.batteryMax); if(p.battery<=0){G.flashlight=false; G.log("The flashlight dies.", COL.red);} }
+
+  /* --- teammates --- */
+  for(let i=0;i<G.mates.length;i++){
+    const m=G.mates[i];
+    m.distract=Math.max(0,m.distract-dt);
+    // occasionally wander off to poke at furniture (this is how mimics get in)
+    if(inHouse&&inst.curse>=CurseState.OMEN&&inst.curse<CurseState.RESOLVED&&m.distract<=0&&Math.random()<0.0022){
+      const f=inst.furniture[Math.floor(Math.random()*inst.furniture.length)];
+      if(f){ m.target={x:f.x,y:f.y}; m.distract=4+Math.random()*4; }
+    }
+    let tx,ty;
+    if(m.target&&m.distract>0){ tx=m.target.x; ty=m.target.y; }
+    else { m.target=null; const a=(i?2.4:0.75)+Math.PI; tx=p.x+Math.cos(p.aim+a)*34; ty=p.y+Math.sin(p.aim+a)*34; }
+    const d=Math.hypot(tx-m.x,ty-m.y);
+    if(d>14){ const s=Math.min(175*dt,d); moveEntity(m,(tx-m.x)/d*s,(ty-m.y)/d*s,inHouse); }
+    // isolation timer feeds the mimic
+    if(inHouse&&dist(m,p)>200) m.farT+=dt; else m.farT=Math.max(0,m.farT-dt*2);
+  }
+
+  /* --- world-only logic --- */
+  if(!inHouse){
+    G.cam.x=clamp(p.x-W/2,0,WORLD.w-W); G.cam.y=clamp(p.y-H/2,0,WORLD.h-H);
+  } else {
+    G.cam.x=0; G.cam.y=0;
+    updateHouse(dt);
+  }
+
+  /* --- bullets --- */
+  for(let i=G.bullets.length-1;i>=0;i--){
+    const b=G.bullets[i];
+    b.x+=b.dx*dt; b.y+=b.dy*dt; b.life-=dt;
+    let dead=b.life<=0;
+    if(!dead){ dead = inHouse ? houseCollide(inst,b.x,b.y,3) : worldCollide(b.x,b.y,3); }
+    if(!dead&&inHouse&&inst.monster&&inst.monster.stagger<=0.9&&Math.hypot(b.x-inst.monster.x,b.y-inst.monster.y)<inst.monster.r+5){
+      const M=inst.monster;
+      M.stagger=1.15; M.x+=b.dx*0.05*dt*60; M.y+=b.dy*0.05*dt*60;
+      if(!G.staggerTip){ G.staggerTip=true; G.log("It staggers — but lead won't lift a curse.", "#e08040"); }
+      Sfx.growl(); dead=true;
+    }
+    if(dead) G.bullets.splice(i,1);
+  }
+
+  /* --- resolve ambience --- */
+  if(inHouse&&inst.curse>=CurseState.SEAL&&inst.curse<CurseState.RESOLVED){
+    p.res-= (G.flashlight?0.22:0.45)*dt;
+    for(const m of G.mates) if(dist(m,p)<130) p.res+=0.18*dt;
+    if(inst.ward&&dist(p,inst.ward)<inst.ward.r) p.res+=3.5*dt;
+    if(inst.monster&&dist(inst.monster,p)<160) p.res-=1.2*dt;
+    p.res=clamp(p.res,0,p.resMax);
+  }
+
+  /* --- death --- */
+  if(p.hp<=0){ G.state=GameState.GAME_OVER; G.overCause="Your body gave out. The zone keeps what it kills."; }
+  else if(p.res<=0){ G.state=GameState.GAME_OVER; G.overCause="Your mind surrendered to the house. You are still in there, setting the table."; }
+}
+
+function updateHouse(dt){
+  const inst=G.house, p=G.player;
+  inst.curseT+=dt;
+
+  /* hidden door sensing (Celtic sees far) */
+  G.hiddenSeen=false;
+  for(const hd of inst.hidden){
+    if(hd.opened) continue;
+    const hx=hd.c*TILE+TILE/2, hy=hd.r*TILE+TILE/2;
+    if(Math.hypot(p.x-hx,p.y-hy)<faction().hiddenRadius){ G.hiddenSeen=true; hd.seen=true; }
+  }
+
+  /* curse state machine */
+  switch(inst.curse){
+    case CurseState.OMEN: if(inst.curseT>5) setCurse(inst,CurseState.SEAL); break;
+    case CurseState.SEAL: if(inst.curseT>6) setCurse(inst,CurseState.HUNT); break;
+    case CurseState.HUNT: if(inst.curseT>35) setCurse(inst,CurseState.DISTORTION); break;
+    case CurseState.JUDGMENT:{
+      if(G.channeling){
+        let rate=1;
+        if(faction().key===inst.def.affinity) rate*=1.2;
+        G.channel+=dt*rate;
+        const need=faction().ritualTime||5;
+        if(G.channel>=need){ G.channeling=false; G.channel=0; p.inv.salt--; setCurse(inst,CurseState.RESOLVED); }
+      } else {
+        // ritual was interrupted — fall back to the hunt
+        setCurse(inst,inst.preState===CurseState.DISTORTION?CurseState.DISTORTION:CurseState.HUNT);
+      }
+      break; }
+  }
+
+  /* whispers */
+  if(inst.curse>=CurseState.OMEN&&inst.curse<CurseState.RESOLVED){
+    inst.whisperT-=dt;
+    if(inst.whisperT<=0){
+      inst.whisperT=5+Math.random()*5;
+      const t=inst.def.whispers[Math.floor(Math.random()*inst.def.whispers.length)];
+      G.whispers.push({text:t,x:120+Math.random()*(W-240),y:150+Math.random()*(H-300),t:0});
+    }
+  }
+  for(let i=G.whispers.length-1;i>=0;i--){ G.whispers[i].t+=dt; if(G.whispers[i].t>4) G.whispers.splice(i,1); }
+
+  /* monster AI */
+  const M=inst.monster;
+  if(M&&inst.curse>=CurseState.HUNT&&inst.curse<CurseState.RESOLVED){
+    M.wob+=dt*6; M.hitCd=Math.max(0,M.hitCd-dt);
+    if(M.stagger>0){ M.stagger-=dt; }
+    else{
+      let spd=95;
+      if(inst.curse===CurseState.DISTORTION) spd=120;
+      if(inst.curse===CurseState.JUDGMENT) spd=150;
+      if(G.night) spd*=1.2;
+      if(faction().monsterSlow) spd*=faction().monsterSlow;
+      if(faction().monsterSlow&&inst.def.curseType.indexOf("Debt")>=0) spd*=0.9; // ledger expertise
+      // flashlight beam slows it
+      if(G.flashlight&&pointInCone(M.x,M.y)) spd*=0.72;
+      // teammates hold the circle during judgment
+      for(const m of G.mates) if(Math.hypot(m.x-M.x,m.y-M.y)<80) spd*=0.62;
+      const d=dist(M,p);
+      if(d>1){
+        const vx=(p.x-M.x)/d, vy=(p.y-M.y)/d;
+        // slight jitter to unstick from corners
+        const jx=Math.cos(M.wob*1.7)*0.25, jy=Math.sin(M.wob*1.3)*0.25;
+        moveEntity(M,(vx+jx)*spd*dt,(vy+jy)*spd*dt,true);
+      }
+      if(d<M.r+p.r+4&&M.hitCd<=0&&p.hitCd<=0){
+        M.hitCd=1; p.hitCd=0.9; p.hp=clamp(p.hp-14,0,p.hpMax);
+        G.dmgFlash=1; G.shake=9; Sfx.hurt();
+        const a=Math.atan2(p.y-M.y,p.x-M.x);
+        moveEntity(p,Math.cos(a)*26,Math.sin(a)*26,true);
+        if(G.channeling){ G.channeling=false; G.channel=0; G.log("The blow breaks your rite!", COL.red); }
+        G.log(inst.def.monster+" tears at you. (−14 health)", COL.red);
+      }
+    }
+  }
+
+  /* mimic system: isolation breeds copies */
+  G.mimicCd=Math.max(0,G.mimicCd-dt);
+  if(!inst.mimic&&G.mimicCd<=0&&inst.curse>=CurseState.SEAL&&inst.curse<CurseState.RESOLVED){
+    const lost=G.mates.find(m=>m.farT>4);
+    if(lost){
+      inst.mimic={x:lost.x,y:lost.y,r:9,name:lost.name,reveal:0,dissolve:0};
+      lost.farT=0; lost.target=null; // the real one hurries back
+      G.stats.mimics++;
+      Sfx.mimic();
+    }
+  }
+  const mk=inst.mimic;
+  if(mk){
+    if(mk.dissolve>0){
+      mk.dissolve-=dt;
+      if(mk.dissolve<=0){ inst.mimic=null; G.mimicCd=18; p.res=clamp(p.res+5,0,p.resMax);
+        G.log("The false "+mk.name+" dissolves in the light. (+5 resolve)", COL.green); }
+    } else {
+      const d=dist(mk,p);
+      if(d>26){ const s=70*dt; moveEntity(mk,(p.x-mk.x)/d*s,(p.y-mk.y)/d*s,true); }
+      // flashlight reveals it
+      if(G.flashlight&&pointInCone(mk.x,mk.y)){ mk.reveal+=dt; if(mk.reveal>1){ mk.dissolve=0.8; Sfx.mimic(); } }
+      else mk.reveal=Math.max(0,mk.reveal-dt*0.5);
+      if(d<mk.r+p.r+3){
+        inst.mimic=null; G.mimicCd=18;
+        p.res=clamp(p.res-20,0,p.resMax); G.dmgFlash=0.8; G.shake=7; Sfx.mimic();
+        G.log("It was never "+mk.name+". Cold hands, wrong smile. (−20 resolve)", COL.red);
+      }
+    }
+  }
+}
+function pointInCone(x,y){
+  const p=G.player, d=Math.hypot(x-p.x,y-p.y);
+  if(d>270) return false;
+  let a=Math.atan2(y-p.y,x-p.x)-p.aim;
+  while(a>Math.PI)a-=2*Math.PI; while(a<-Math.PI)a+=2*Math.PI;
+  return Math.abs(a)<0.5;
+}
+
+/* ------------------------------ render ----------------------------- */
+function render(){
+  ctx.save();
+  ctx.fillStyle="#06060b"; ctx.fillRect(0,0,W,H);
+  if(G.state===GameState.TITLE){ renderTitle(); ctx.restore(); return; }
+
+  // screen shake + distortion jitter
+  let sx=0,sy=0;
+  if(G.shake>0){ sx=(Math.random()-0.5)*G.shake; sy=(Math.random()-0.5)*G.shake; }
+  if(G.state===GameState.HOUSE&&G.house.curse===CurseState.DISTORTION){ sx+=Math.sin(G.time*13)*2; sy+=Math.cos(G.time*11)*2; }
+  ctx.translate(sx,sy);
+
+  if(G.state===GameState.WORLD||((G.state===GameState.GAME_OVER||G.state===GameState.WIN)&&!G.house)) renderWorld();
+  else renderHouse();
+
+  ctx.translate(-sx,-sy);
+  renderHUD();
+  if(G.showMap) renderMapOverlay();
+  if(G.state===GameState.GAME_OVER) renderEnd("THE HOUSE KEEPS YOU", G.overCause, COL.red);
+  if(G.state===GameState.WIN) renderEnd("THE ZONE GOES QUIET", "All three curses resolved. The ancients close their eyes — for now.", COL.green);
+  ctx.restore();
+}
+
+/* ---------- world rendering ---------- */
+function renderWorld(){
+  const cx=G.cam.x, cy=G.cam.y;
+  ctx.save(); ctx.translate(-cx,-cy);
+
+  // ground
+  ctx.fillStyle=G.night?"#0b0f0d":"#15201a";
+  ctx.fillRect(cx,cy,W,H);
+  // subtle grass tufts (deterministic grid)
+  ctx.fillStyle=G.night?"#0e1410":"#1b2a20";
+  for(let gx=Math.floor(cx/80)*80; gx<cx+W; gx+=80)
+    for(let gy=Math.floor(cy/80)*80; gy<cy+H; gy+=80){
+      const h=hash2(gx,gy); if(h%3===0) ctx.fillRect(gx+h%60, gy+(h>>3)%60, 3, 3);
+    }
+  // dirt paths between safehouse and houses
+  ctx.strokeStyle=G.night?"#181510":"#2a241a"; ctx.lineWidth=26; ctx.lineCap="round";
+  const s=VILLAGE.safehouse;
+  for(const h of VILLAGE.houses){
+    ctx.beginPath(); ctx.moveTo(s.x+s.w/2,s.y+s.h+8); ctx.lineTo(h.x+h.w/2,h.y+h.h+8); ctx.stroke();
+  }
+
+  // crates
+  for(const c of CRATES){ if(c.taken) continue;
+    ctx.fillStyle="#4a3a22"; ctx.fillRect(c.x-10,c.y-10,20,20);
+    ctx.strokeStyle="#6a5432"; ctx.lineWidth=2; ctx.strokeRect(c.x-10,c.y-10,20,20);
+    ctx.beginPath(); ctx.moveTo(c.x-10,c.y-10); ctx.lineTo(c.x+10,c.y+10); ctx.stroke();
+  }
+  // rocks
+  for(const r of ROCKS){ ctx.fillStyle="#333842"; ctx.beginPath(); ctx.arc(r.x,r.y,r.r,0,7); ctx.fill(); }
+
+  // buildings
+  drawBuilding(s,"SAFEHOUSE","#274a33",COL.green,true);
+  for(const h of VILLAGE.houses){
+    const inst=G.houseInst[h.id], resolved=inst&&inst.resolved;
+    drawBuilding(h,HOUSES[h.id].name.toUpperCase(), resolved?"#274a33":"#3a2f45", resolved?COL.green:COL.purple,false,resolved);
+  }
+
+  // trees (draw after buildings for canopy overlap feel)
+  for(const t of TREES){
+    ctx.fillStyle="rgba(0,0,0,.3)"; ctx.beginPath(); ctx.ellipse(t.x+3,t.y+5,t.r,t.r*0.5,0,0,7); ctx.fill();
+    ctx.fillStyle=G.night?"#0e2015":"#1d3a26"; ctx.beginPath(); ctx.arc(t.x,t.y,t.r,0,7); ctx.fill();
+    ctx.fillStyle=G.night?"#123020":"#28502f"; ctx.beginPath(); ctx.arc(t.x-t.r*0.25,t.y-t.r*0.3,t.r*0.6,0,7); ctx.fill();
+  }
+
+  drawEntities(false);
+  ctx.restore();
+
+  // darkness + lights
+  renderDarkness(false);
+}
+function drawBuilding(h,label,wallCol,glowCol,isSafe,resolved){
+  // shadow
+  ctx.fillStyle="rgba(0,0,0,.35)"; ctx.fillRect(h.x+6,h.y+8,h.w,h.h);
+  // walls
+  ctx.fillStyle=wallCol; ctx.fillRect(h.x,h.y,h.w,h.h);
+  // roof (simple pseudo-3D ridge)
+  ctx.fillStyle="rgba(255,255,255,.06)"; ctx.fillRect(h.x,h.y,h.w,h.h*0.45);
+  ctx.strokeStyle="rgba(0,0,0,.5)"; ctx.lineWidth=3; ctx.strokeRect(h.x,h.y,h.w,h.h);
+  ctx.strokeStyle="rgba(255,255,255,.12)"; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(h.x,h.y+h.h*0.45); ctx.lineTo(h.x+h.w,h.y+h.h*0.45); ctx.stroke();
+  // windows glow purple at night for cursed houses
+  const pulse=0.5+0.5*Math.sin(G.time*2.4);
+  const winCol = isSafe||resolved ? "rgba(70,220,130," : "rgba(160,80,255,";
+  const winA = G.night ? 0.35+0.4*pulse : (isSafe||resolved?0.25:0.12+0.1*pulse);
+  ctx.fillStyle=winCol+winA+")";
+  for(let i=0;i<3;i++) ctx.fillRect(h.x+18+i*(h.w-36)/2.2, h.y+h.h*0.55, 16, 14);
+  // door
+  const dx=h.x+h.w/2;
+  ctx.fillStyle="#241a10"; ctx.fillRect(dx-11,h.y+h.h-26,22,26);
+  glow(dx,h.y+h.h+6,resolved?18:14+(G.night?8*pulse:0), glowCol, G.night?0.5:0.3);
+  // label
+  ctx.fillStyle="rgba(230,225,210,.85)"; ctx.font="bold 12px monospace"; ctx.textAlign="center";
+  ctx.fillText(label,h.x+h.w/2,h.y-8);
+  if(resolved){ ctx.fillStyle=COL.green; ctx.fillText("✓ RESOLVED",h.x+h.w/2,h.y+h.h+30); }
+}
+
+/* ---------- house rendering ---------- */
+function renderHouse(){
+  const inst=G.house||G.houseInst[G.houseIdx];
+  if(!inst) return;
+  const pulse=0.5+0.5*Math.sin(G.time*3);
+  const cs=inst.curse;
+
+  // floor
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    const ch=inst.tiles[r][c], x=c*TILE, y=r*TILE;
+    if(ch==="#"||(ch==="H"&&!inst.hidden.find(h=>h.c===c&&h.r===r).opened)){ continue; }
+    // floor
+    const base=((c+r)%2===0)?"#1a1a24":"#181822";
+    ctx.fillStyle=base; ctx.fillRect(x,y,TILE,TILE);
+    // door frames
+    if(ch==="d"){ ctx.strokeStyle="#4a3a26"; ctx.lineWidth=3; ctx.strokeRect(x+4,y+4,TILE-8,TILE-8); }
+  }
+  // danger path (red UX) — visible from OMEN, burning during HUNT+
+  for(const t of inst.danger){
+    const x=t.c*TILE,y=t.r*TILE;
+    if(cs>=CurseState.HUNT){ ctx.fillStyle="rgba(255,40,40,"+(0.10+0.12*pulse)+")"; ctx.fillRect(x,y,TILE,TILE); }
+    else if(cs>=CurseState.OMEN){ ctx.fillStyle="rgba(255,40,40,0.05)"; ctx.fillRect(x,y,TILE,TILE); }
+  }
+  // walls with pseudo-depth
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    const hd=inst.hidden.find(h=>h.c===c&&h.r===r);
+    const solidWall = inst.tiles[r][c]==="#"||(hd&&!hd.opened);
+    if(!solidWall){
+      if(hd&&hd.opened){ // opened hidden passage: draw special floor
+        ctx.fillStyle="#20182c"; ctx.fillRect(c*TILE,r*TILE,TILE,TILE);
+        ctx.strokeStyle=faction().color; ctx.lineWidth=2; ctx.strokeRect(c*TILE+5,r*TILE+5,TILE-10,TILE-10);
+      }
+      continue;
+    }
+    const x=c*TILE,y=r*TILE;
+    ctx.fillStyle="#2c2c3a"; ctx.fillRect(x,y,TILE,TILE);
+    ctx.fillStyle="rgba(255,255,255,.07)"; ctx.fillRect(x,y,TILE,6);
+    if(r+1<ROWS&&inst.tiles[r+1][c]!=="#") { ctx.fillStyle="rgba(0,0,0,.4)"; ctx.fillRect(x,y+TILE-8,TILE,8); }
+    // hidden door tell (crack) when sensed
+    if(hd&&hd.seen&&!hd.opened){
+      ctx.strokeStyle=faction().color; ctx.lineWidth=2;
+      ctx.setLineDash([4,4]);
+      ctx.strokeRect(x+4,y+4,TILE-8,TILE-8);
+      ctx.setLineDash([]);
+      glow(x+TILE/2,y+TILE/2,14,faction().color,0.25);
+    }
+  }
+  // exit door
+  {
+    const x=inst.exit.c*TILE, y=inst.exit.r*TILE;
+    ctx.fillStyle="#3a2a18"; ctx.fillRect(x,y,TILE,TILE);
+    ctx.strokeStyle="#5a452a"; ctx.lineWidth=2; ctx.strokeRect(x+3,y+3,TILE-6,TILE-6);
+    if(inst.exit.sealed){
+      glow(x+TILE/2,y+TILE/2,26+8*pulse,COL.red,0.5);
+      ctx.strokeStyle=COL.red; ctx.lineWidth=4;
+      for(let i=0;i<3;i++){ ctx.beginPath(); ctx.moveTo(x-4,y+8+i*12); ctx.lineTo(x+TILE+4,y+8+i*12); ctx.stroke(); }
+    } else {
+      glow(x+TILE/2,y+TILE/2,20,cs===CurseState.RESOLVED?COL.green:"#c8a060",0.35);
+      ctx.fillStyle="#d8c8a0"; ctx.font="10px monospace"; ctx.textAlign="center";
+      ctx.fillText("EXIT",x+TILE/2,y-4);
+    }
+  }
+  // furniture
+  for(const f of inst.furniture){
+    const x=f.x-14,y=f.y-11;
+    ctx.fillStyle=f.looted?"#2a2420":"#45351f";
+    ctx.fillRect(x,y,28,22);
+    ctx.strokeStyle=f.looted?"#3a342e":"#6a5432"; ctx.lineWidth=2; ctx.strokeRect(x,y,28,22);
+    if(!f.looted){ ctx.fillStyle="rgba(255,255,255,.1)"; ctx.fillRect(x,y,28,6); }
+  }
+  // salt caches
+  for(const s of inst.salts){ if(s.taken) continue;
+    ctx.fillStyle="#e8e4d8"; ctx.beginPath(); ctx.moveTo(s.x,s.y-8); ctx.lineTo(s.x+8,s.y+6); ctx.lineTo(s.x-8,s.y+6); ctx.closePath(); ctx.fill();
+    glow(s.x,s.y,10,"#fff",0.15);
+  }
+  // ward circle (green)
+  if(inst.ward){
+    const wd=inst.ward, act=cs>=CurseState.SEAL&&cs<CurseState.RESOLVED;
+    glow(wd.x,wd.y,wd.r*(0.8+0.2*pulse),COL.green,act?0.30:0.10);
+    ctx.strokeStyle="rgba(70,230,140,"+(act?0.8:0.35)+")"; ctx.lineWidth=3;
+    ctx.setLineDash([10,7]); ctx.lineDashOffset=-G.time*20;
+    ctx.beginPath(); ctx.arc(wd.x,wd.y,wd.r,0,7); ctx.stroke(); ctx.setLineDash([]);
+    ctx.strokeStyle="rgba(70,230,140,"+(act?0.5:0.2)+")"; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(wd.x,wd.y,wd.r*0.55,0,7); ctx.stroke();
+    // rune ticks
+    for(let i=0;i<8;i++){ const a=i/8*Math.PI*2+G.time*0.4;
+      ctx.beginPath(); ctx.moveTo(wd.x+Math.cos(a)*(wd.r*0.7),wd.y+Math.sin(a)*(wd.r*0.7));
+      ctx.lineTo(wd.x+Math.cos(a)*(wd.r*0.85),wd.y+Math.sin(a)*(wd.r*0.85)); ctx.stroke(); }
+    ctx.fillStyle="rgba(70,230,140,.7)"; ctx.font="10px monospace"; ctx.textAlign="center";
+    ctx.fillText("WARD",wd.x,wd.y-wd.r-6);
+  }
+  // clues (blue) — visible from OMEN
+  if(cs>=CurseState.OMEN&&cs<CurseState.RESOLVED){
+    for(const cl of inst.clues){ if(cl.taken) continue;
+      const flick = cl.fake ? (Math.sin(G.time*17)>0.6?0.4:1) : 1;
+      glow(cl.x,cl.y,14+5*pulse,COL.blue,0.4*flick);
+      ctx.save(); ctx.translate(cl.x,cl.y); ctx.rotate(Math.PI/4);
+      ctx.fillStyle="rgba(90,170,255,"+(0.9*flick)+")"; ctx.fillRect(-6,-6,12,12);
+      ctx.restore();
+      if(cl.fake&&faction().seesFake){
+        ctx.strokeStyle=COL.red; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.moveTo(cl.x-9,cl.y-9); ctx.lineTo(cl.x+9,cl.y+9); ctx.stroke();
+        ctx.fillStyle=COL.red; ctx.font="9px monospace"; ctx.textAlign="center"; ctx.fillText("FALSE",cl.x,cl.y-14);
+      }
+    }
+  }
+  // purple trigger object
+  if(inst.trigger&&!inst.trigger.used){
+    const t=inst.trigger;
+    const sense = faction().purpleSense || dist(G.player,t)<220 || G.night;
+    const rad = (G.night?26:14)+8*pulse;
+    glow(t.x,t.y,rad,COL.purple,G.night?0.55:0.35);
+    drawTriggerIcon(inst.id,t.x,t.y);
+    if(sense){
+      ctx.fillStyle=COL.purple; ctx.font="bold 12px monospace"; ctx.textAlign="center";
+      ctx.fillText("?",t.x,t.y-18-3*pulse);
+    }
+  }
+  // monster
+  if(inst.monster) drawMonster(inst.monster,pulse);
+  // mimic + entities
+  drawEntities(true);
+  if(inst.mimic) drawMimic(inst.mimic);
+
+  // whispers
+  for(const wsp of G.whispers){
+    const a=wsp.t<0.5?wsp.t*2:(wsp.t>3?(4-wsp.t):1);
+    ctx.fillStyle="rgba(180,130,230,"+(a*0.55)+")";
+    ctx.font="italic 13px serif"; ctx.textAlign="center";
+    ctx.fillText(wsp.text,wsp.x,wsp.y-wsp.t*8);
+  }
+
+  renderDarkness(true);
+
+  // judgment channel ring
+  if(G.channeling){
+    const need=faction().ritualTime||5;
+    const p=G.player, frac=clamp(G.channel/need,0,1);
+    ctx.strokeStyle=COL.green; ctx.lineWidth=5;
+    ctx.beginPath(); ctx.arc(p.x,p.y,26,-Math.PI/2,-Math.PI/2+frac*Math.PI*2); ctx.stroke();
+    ctx.fillStyle=COL.green; ctx.font="bold 12px monospace"; ctx.textAlign="center";
+    ctx.fillText("JUDGMENT "+Math.round(frac*100)+"%",p.x,p.y-36);
+    glow(p.x,p.y,40+frac*50,COL.green,0.3);
+  }
+  // distortion overlay
+  if(inst.curse===CurseState.DISTORTION){
+    ctx.fillStyle="rgba(140,40,220,"+(0.05+0.04*Math.sin(G.time*7))+")"; ctx.fillRect(0,0,W,H);
+    if(Math.sin(G.time*3.7)>0.97){ ctx.fillStyle="rgba(255,255,255,.05)"; ctx.fillRect(0,Math.random()*H,W,20); }
+  }
+}
+function drawTriggerIcon(id,x,y){
+  ctx.save(); ctx.translate(x,y);
+  ctx.strokeStyle=COL.purple; ctx.fillStyle="rgba(176,96,255,.9)"; ctx.lineWidth=2;
+  if(id===0){ // toy horse: body + head + rockers
+    ctx.fillRect(-8,-3,14,8); ctx.fillRect(2,-10,6,9);
+    ctx.beginPath(); ctx.arc(0,7,10,0.15*Math.PI,0.85*Math.PI); ctx.stroke();
+  } else if(id===1){ // clay tablet with cuneiform ticks
+    ctx.fillRect(-8,-10,16,20);
+    ctx.strokeStyle="#20102a";
+    for(let i=0;i<4;i++){ ctx.beginPath(); ctx.moveTo(-5,-6+i*5); ctx.lineTo(5,-6+i*5); ctx.stroke(); }
+    ctx.strokeStyle=COL.purple; ctx.beginPath(); ctx.moveTo(-8,4); ctx.lineTo(8,-2); ctx.stroke(); // crack
+  } else { // funeral mirror: oval + sheen
+    ctx.beginPath(); ctx.ellipse(0,0,8,12,0,0,7); ctx.fill();
+    ctx.strokeStyle="#e8e0f8"; ctx.beginPath(); ctx.moveTo(-3,-7); ctx.lineTo(2,3); ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawMonster(M,pulse){
+  const stag=M.stagger>0;
+  glow(M.x,M.y,30+10*pulse,COL.red,stag?0.25:0.5);
+  ctx.save(); ctx.translate(M.x,M.y); ctx.rotate(Math.sin(M.wob)*0.2);
+  ctx.fillStyle=stag?"#7a2020":"#c02020";
+  ctx.beginPath();
+  for(let i=0;i<9;i++){ const a=i/9*Math.PI*2; const rr=M.r+(i%2?7:0)+Math.sin(M.wob*2+i)*2;
+    const px=Math.cos(a)*rr, py=Math.sin(a)*rr;
+    i?ctx.lineTo(px,py):ctx.moveTo(px,py); }
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle="#ffd8d8";
+  ctx.beginPath(); ctx.arc(-4,-3,2.4,0,7); ctx.arc(5,-2,2.4,0,7); ctx.fill();
+  ctx.restore();
+  if(stag){ ctx.fillStyle="#ffb060"; ctx.font="bold 11px monospace"; ctx.textAlign="center"; ctx.fillText("STAGGERED",M.x,M.y-M.r-14); }
+}
+function drawMimic(mk){
+  const a = mk.dissolve>0 ? mk.dissolve/0.8 : 1;
+  ctx.globalAlpha=a;
+  // looks exactly like a teammate...
+  drawPerson(mk.x,mk.y,mk.r,"#7a9ac2","#4a6a92",mk.name);
+  // ...except the outline bleeds red
+  const exposed = mk.reveal>0.15||mk.dissolve>0;
+  ctx.strokeStyle="rgba(255,50,50,"+(exposed?0.95:0.22+0.15*Math.sin(G.time*5))+")";
+  ctx.lineWidth=exposed?3:1.5;
+  ctx.beginPath(); ctx.arc(mk.x,mk.y,mk.r+4,0,7); ctx.stroke();
+  if(exposed){ ctx.fillStyle=COL.red; ctx.font="bold 12px monospace"; ctx.textAlign="center"; ctx.fillText("!! MIMIC !!",mk.x,mk.y-20); }
+  ctx.globalAlpha=1;
+}
+function drawPerson(x,y,r,body,dark,name){
+  ctx.fillStyle="rgba(0,0,0,.35)"; ctx.beginPath(); ctx.ellipse(x,y+r*0.8,r*1.1,r*0.45,0,0,7); ctx.fill();
+  ctx.fillStyle=dark; ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill();
+  ctx.fillStyle=body; ctx.beginPath(); ctx.arc(x-r*0.15,y-r*0.15,r*0.72,0,7); ctx.fill();
+  if(name){ ctx.fillStyle="rgba(200,210,230,.75)"; ctx.font="10px monospace"; ctx.textAlign="center"; ctx.fillText(name,x,y-r-6); }
+}
+function drawEntities(inHouse){
+  const p=G.player;
+  // teammates
+  for(const m of G.mates) drawPerson(m.x,m.y,m.r,"#7a9ac2","#4a6a92",m.name);
+  // player (blue/gray)
+  drawPerson(p.x,p.y,p.r,"#9ab8dd","#5a7aa2",null);
+  // facing tick + gun
+  ctx.strokeStyle="#dde8f8"; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(p.x+Math.cos(p.aim)*6,p.y+Math.sin(p.aim)*6);
+  ctx.lineTo(p.x+Math.cos(p.aim)*17,p.y+Math.sin(p.aim)*17); ctx.stroke();
+  if(p.hitCd>0.5){ ctx.strokeStyle="rgba(255,60,60,.7)"; ctx.beginPath(); ctx.arc(p.x,p.y,p.r+5,0,7); ctx.stroke(); }
+  // bullets
+  ctx.fillStyle="#ffe8a0";
+  for(const b of G.bullets){ ctx.beginPath(); ctx.arc(b.x,b.y,2.6,0,7); ctx.fill(); glow(b.x,b.y,7,"#ffd060",0.4); }
+}
+function glow(x,y,r,color,alpha){
+  if(r<=0.5) return;
+  const g=ctx.createRadialGradient(x,y,0,x,y,r);
+  g.addColorStop(0,color); g.addColorStop(1,"rgba(0,0,0,0)");
+  ctx.save(); ctx.globalAlpha=alpha; ctx.globalCompositeOperation="lighter";
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill(); ctx.restore();
+}
+
+/* ---------- darkness & flashlight ---------- */
+const darkC=document.createElement("canvas"); darkC.width=W; darkC.height=H;
+const dctx=darkC.getContext("2d");
+function renderDarkness(inHouse){
+  const p=G.player;
+  let amb;
+  if(!inHouse) amb = G.night?0.82:0.0;
+  else {
+    const cs=G.house?G.house.curse:0;
+    amb = cs>=CurseState.DISTORTION?0.80 : cs>=CurseState.SEAL?0.72 : (G.night?0.66:0.42);
+  }
+  if(amb<=0.01) { // day world: just a soft vignette
+    vignette(0.35); return;
+  }
+  dctx.clearRect(0,0,W,H);
+  dctx.fillStyle="rgba(2,2,8,"+amb+")"; dctx.fillRect(0,0,W,H);
+  dctx.globalCompositeOperation="destination-out";
+  const px=p.x-G.cam.x, py=p.y-G.cam.y;
+  // ambient personal light
+  cutLight(px,py,inHouse?118:130,0.85);
+  // flashlight cone
+  if(G.flashlight&&p.battery>0){
+    const a=p.aim, len=270, half=0.5;
+    dctx.save();
+    dctx.beginPath(); dctx.moveTo(px,py);
+    dctx.arc(px,py,len,a-half,a+half); dctx.closePath(); dctx.clip();
+    const g=dctx.createRadialGradient(px,py,10,px,py,len);
+    g.addColorStop(0,"rgba(0,0,0,0.95)"); g.addColorStop(0.8,"rgba(0,0,0,0.75)"); g.addColorStop(1,"rgba(0,0,0,0)");
+    dctx.fillStyle=g; dctx.fillRect(px-len,py-len,len*2,len*2);
+    dctx.restore();
+  }
+  // fixed lights in house: ward, trigger, sealed door, clues
+  if(inHouse&&G.house){
+    const inst=G.house;
+    if(inst.ward) cutLight(inst.ward.x,inst.ward.y,80,0.5);
+    if(inst.trigger&&!inst.trigger.used) cutLight(inst.trigger.x,inst.trigger.y,G.night?70:40,0.6);
+    if(inst.exit.sealed) cutLight(inst.exit.c*TILE+20,inst.exit.r*TILE+20,50,0.5);
+    if(inst.curse>=CurseState.OMEN) for(const cl of inst.clues) if(!cl.taken) cutLight(cl.x,cl.y,34,0.5);
+    if(inst.monster) cutLight(inst.monster.x,inst.monster.y,44,0.4);
+  } else {
+    // world: house door glows pierce night
+    for(const h of [...VILLAGE.houses,VILLAGE.safehouse])
+      cutLight(h.x+h.w/2-G.cam.x,h.y+h.h+6-G.cam.y,46,0.5);
+    for(const c of CRATES) if(!c.taken) cutLight(c.x-G.cam.x,c.y-G.cam.y,24,0.3);
+  }
+  dctx.globalCompositeOperation="source-over";
+  ctx.drawImage(darkC,0,0);
+  vignette(0.5);
+  // green resolve flash
+  if(G.greenFlash>0){ ctx.fillStyle="rgba(60,220,130,"+(G.greenFlash*0.25)+")"; ctx.fillRect(0,0,W,H); }
+  if(G.dmgFlash>0){ ctx.fillStyle="rgba(255,30,30,"+(G.dmgFlash*0.22)+")"; ctx.fillRect(0,0,W,H); }
+}
+function cutLight(x,y,r,strength){
+  const g=dctx.createRadialGradient(x,y,0,x,y,r);
+  g.addColorStop(0,"rgba(0,0,0,"+strength+")"); g.addColorStop(1,"rgba(0,0,0,0)");
+  dctx.fillStyle=g; dctx.beginPath(); dctx.arc(x,y,r,0,7); dctx.fill();
+}
+function vignette(a){
+  const g=ctx.createRadialGradient(W/2,H/2,H*0.35,W/2,H/2,H*0.75);
+  g.addColorStop(0,"rgba(0,0,0,0)"); g.addColorStop(1,"rgba(0,0,0,"+a+")");
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+}
+
+/* ---------- HUD ---------- */
+function bar(x,y,w,label,val,max,col){
+  ctx.fillStyle="rgba(0,0,0,.55)"; ctx.fillRect(x,y,w,10);
+  ctx.fillStyle=col; ctx.fillRect(x+1,y+1,(w-2)*clamp(val/max,0,1),8);
+  ctx.strokeStyle="rgba(255,255,255,.25)"; ctx.lineWidth=1; ctx.strokeRect(x+0.5,y+0.5,w,10);
+  ctx.fillStyle="rgba(230,230,230,.85)"; ctx.font="9px monospace"; ctx.textAlign="left";
+  ctx.fillText(label,x+w+6,y+8.5);
+}
+function renderHUD(){
+  const p=G.player;
+  // left bars
+  const bx=14; let by=14;
+  bar(bx,by,120,"HEALTH",p.hp,p.hpMax,"#e04040"); by+=15;
+  bar(bx,by,120,"STAMINA",p.sta,100,"#e0c040"); by+=15;
+  bar(bx,by,120,"RESOLVE",p.res,p.resMax,"#b060ff"); by+=15;
+  bar(bx,by,120,"HUNGER",100-p.hunger,100,"#e08040"); by+=15;
+  bar(bx,by,120,"THIRST",100-p.thirst,100,"#40b8e0"); by+=15;
+  bar(bx,by,120,"BATTERY",p.battery,p.batteryMax,"#c8e8c0"); by+=18;
+  ctx.fillStyle=faction().color; ctx.font="10px monospace"; ctx.textAlign="left";
+  ctx.fillText(faction().name.split("·")[0].trim().toUpperCase()+" · Houses "+G.resolvedCount+"/3",bx,by+4);
+
+  // right inventory
+  ctx.textAlign="right"; ctx.font="12px monospace";
+  const items=[["FOOD",p.inv.food,"#e0a060"],["WATER",p.inv.water,"#60c0e8"],
+               ["AMMO",p.inv.ammo,"#e8d090"],["SALT",p.inv.salt,"#f0ead8"]];
+  let iy=20;
+  for(const [n,v,c] of items){ ctx.fillStyle=c; ctx.fillText(n+" ×"+v,W-14,iy); iy+=16; }
+  if(G.state===GameState.HOUSE&&G.house){
+    ctx.fillStyle=COL.blue; ctx.fillText("CLUES "+G.house.cluesFound+"/3",W-14,iy); iy+=16;
+  }
+  ctx.fillStyle=G.night?"#8890c8":"#e8d080";
+  ctx.fillText(G.night?"◑ NIGHT":"☀ DAY",W-14,iy); iy+=16;
+  ctx.fillStyle=G.flashlight?"#f0f0c0":"#666";
+  ctx.fillText("⌁ LIGHT "+(G.flashlight?"ON":"OFF"),W-14,iy);
+
+  // house banner + objective
+  if(G.state===GameState.HOUSE&&G.house){
+    const inst=G.house, cs=inst.curse;
+    ctx.textAlign="center";
+    ctx.fillStyle="rgba(0,0,0,.55)"; ctx.fillRect(W/2-190,8,380,36);
+    ctx.strokeStyle=CURSE_COL[cs]; ctx.lineWidth=1.5; ctx.strokeRect(W/2-190,8,380,36);
+    ctx.fillStyle=COL.bone; ctx.font="bold 13px monospace";
+    ctx.fillText(inst.def.name+" — "+inst.def.curseType,W/2,22);
+    ctx.fillStyle=CURSE_COL[cs]; ctx.font="bold 11px monospace";
+    ctx.fillText("CURSE: "+CURSE_NAME[cs]+"  ·  "+objective(inst),W/2,37);
+  }
+  // interact prompt
+  const it=(G.state===GameState.WORLD||G.state===GameState.HOUSE)?nearestInteractable():null;
+  if(it){
+    ctx.textAlign="center"; ctx.font="bold 13px monospace";
+    const y=H-118;
+    ctx.fillStyle="rgba(0,0,0,.6)";
+    const wdt=ctx.measureText("[E] "+it.label).width+24;
+    ctx.fillRect(W/2-wdt/2,y-15,wdt,22);
+    ctx.fillStyle=it.type==="trigger"?COL.purple:it.type==="ritual"?COL.green:it.type==="sealed"?COL.red:"#f0ead8";
+    ctx.fillText("[E] "+it.label,W/2,y);
+  }
+  // clue log (bottom-left)
+  ctx.textAlign="left"; ctx.font="11px monospace";
+  let ly=H-16;
+  for(let i=G.logs.length-1;i>=0;i--){
+    const l=G.logs[i]; l.t+=0.016;
+    const a=clamp(1.3-(G.logs.length-1-i)*0.16,0.25,1);
+    ctx.fillStyle="rgba(0,0,0,.45)"; ctx.fillRect(10,ly-11,ctx.measureText(l.text).width+10,14);
+    ctx.globalAlpha=a; ctx.fillStyle=l.color; ctx.fillText(l.text,14,ly); ctx.globalAlpha=1;
+    ly-=16; if(ly<H-16-16*6) break;
+  }
+  // controls hint
+  ctx.textAlign="center"; ctx.fillStyle="rgba(255,255,255,.28)"; ctx.font="10px monospace";
+  ctx.fillText("WASD move · mouse aim · click/space shoot · E interact · F light · N day/night · M map · R restart",W/2,H-6);
+}
+function objective(inst){
+  switch(inst.curse){
+    case CurseState.DORMANT: return inst.trigger.used?"":"scavenge — the purple object waits";
+    case CurseState.OMEN: return "something stirs… clues revealed";
+    case CurseState.SEAL: return "find "+(3-inst.cluesFound)+" clue(s) — blue lights";
+    case CurseState.HUNT: return inst.cluesFound<3?"survive · clues "+inst.cluesFound+"/3":"reach the GREEN ward — press E";
+    case CurseState.DISTORTION: return inst.cluesFound<3?"the house lies · clues "+inst.cluesFound+"/3":"reach the GREEN ward — press E";
+    case CurseState.JUDGMENT: return "HOLD THE RITE";
+    case CurseState.RESOLVED: return "the exit is open";
+  }
+  return "";
+}
+
+/* ---------- map overlay ---------- */
+function renderMapOverlay(){
+  ctx.fillStyle="rgba(4,4,12,.88)"; ctx.fillRect(60,50,W-120,H-100);
+  ctx.strokeStyle="rgba(180,160,255,.4)"; ctx.strokeRect(60,50,W-120,H-100);
+  ctx.textAlign="center"; ctx.font="bold 14px monospace"; ctx.fillStyle=COL.bone;
+  const distorted = G.state===GameState.HOUSE&&G.house&&G.house.curse===CurseState.DISTORTION;
+  ctx.fillText(distorted?"FIELD MAP — THE MAP LIES":"FIELD MAP",W/2,72);
+  if(G.state===GameState.HOUSE&&G.house){
+    // house floorplan
+    const inst=G.house, sc=0.72, ox=W/2-COLS*TILE*sc/2, oy=110;
+    for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+      let x=ox+c*TILE*sc, y=oy+r*TILE*sc;
+      if(distorted){ x+=Math.sin(hash2(c,r)+G.time*2)*6; y+=Math.cos(hash2(r,c)+G.time*2)*6; }
+      const solid=tileSolid(inst,c,r);
+      ctx.fillStyle=solid?"#39395a":"#14141f";
+      ctx.fillRect(x,y,TILE*sc-1,TILE*sc-1);
+    }
+    // markers
+    const mark=(mx,my,col)=>{ ctx.fillStyle=col; ctx.beginPath(); ctx.arc(ox+mx*sc,oy+my*sc,4,0,7); ctx.fill(); };
+    if(inst.ward) mark(inst.ward.x,inst.ward.y,COL.green);
+    if(inst.trigger&&!inst.trigger.used) mark(inst.trigger.x,inst.trigger.y,COL.purple);
+    if(inst.curse>=CurseState.OMEN) for(const cl of inst.clues) if(!cl.taken) mark(cl.x,cl.y,COL.blue);
+    mark(G.player.x,G.player.y,"#fff");
+    if(inst.monster&&!distorted) mark(inst.monster.x,inst.monster.y,COL.red);
+    ctx.fillStyle="#999"; ctx.font="11px monospace";
+    ctx.fillText(inst.def.ritual,W/2,H-70);
+  } else {
+    // village schematic
+    const sc=0.36, ox=W/2-WORLD.w*sc/2, oy=H/2-WORLD.h*sc/2+14;
+    ctx.strokeStyle="#2a2a3a"; ctx.strokeRect(ox,oy,WORLD.w*sc,WORLD.h*sc);
+    const drawH=(h,label,col)=>{
+      ctx.fillStyle=col; ctx.fillRect(ox+h.x*sc,oy+h.y*sc,h.w*sc,h.h*sc);
+      ctx.fillStyle=COL.bone; ctx.font="10px monospace"; ctx.textAlign="center";
+      ctx.fillText(label,ox+(h.x+h.w/2)*sc,oy+h.y*sc-4);
+    };
+    drawH(VILLAGE.safehouse,"SAFEHOUSE","#1f5a35");
+    for(const h of VILLAGE.houses){
+      const inst=G.houseInst[h.id];
+      drawH(h,HOUSES[h.id].name,(inst&&inst.resolved)?"#1f5a35":"#4a2a6a");
+    }
+    ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(ox+G.player.x*sc,oy+G.player.y*sc,4,0,7); ctx.fill();
+    ctx.fillStyle="#999"; ctx.font="11px monospace"; ctx.textAlign="center";
+    ctx.fillText("Purple houses hold unresolved curses. Green are safe.",W/2,H-70);
+  }
+}
+
+/* ---------- title / end screens ---------- */
+function renderTitle(){
+  const pulse=0.5+0.5*Math.sin(G.time*2);
+  G.time+=1/60;
+  // backdrop: a lonely house with purple windows
+  ctx.fillStyle="#0a0a14"; ctx.fillRect(0,0,W,H);
+  for(let i=0;i<40;i++){ const h=hash2(i,7); ctx.fillStyle="rgba(255,255,255,"+(0.06+(h%40)/400)+")";
+    ctx.fillRect((h%W),(h>>4)%220,1.5,1.5); }
+  glow(W/2,190,150+30*pulse,COL.purple,0.14);
+  ctx.fillStyle="#141420"; ctx.fillRect(W/2-70,150,140,90);
+  ctx.beginPath(); ctx.moveTo(W/2-85,152); ctx.lineTo(W/2,105); ctx.lineTo(W/2+85,152); ctx.closePath();
+  ctx.fillStyle="#1c1c2c"; ctx.fill();
+  ctx.fillStyle="rgba(176,96,255,"+(0.5+0.4*pulse)+")";
+  ctx.fillRect(W/2-45,170,20,22); ctx.fillRect(W/2+25,170,20,22);
+  ctx.fillStyle="#241a10"; ctx.fillRect(W/2-12,205,24,35);
+
+  ctx.textAlign="center";
+  ctx.fillStyle=COL.bone; ctx.font="bold 40px serif";
+  ctx.shadowColor=COL.purple; ctx.shadowBlur=24;
+  ctx.fillText("CURSEBOUND",W/2,300);
+  ctx.shadowBlur=0;
+  ctx.font="16px serif"; ctx.fillStyle="#b8a8d8";
+  ctx.fillText("— Houses of the Ancients · one-shot prototype —",W/2,326);
+  ctx.font="12px monospace"; ctx.fillStyle="#888";
+  ctx.fillText("Every house is a loot cache and a crime scene. Bullets stagger. Knowledge resolves.",W/2,350);
+
+  // faction cards
+  const cw=272, gap=18, x0=W/2-(cw*3+gap*2)/2;
+  for(let i=0;i<3;i++){
+    const f=FACTIONS[i], x=x0+i*(cw+gap), y=380, hh=140, sel=G.factionIdx===i;
+    ctx.fillStyle=sel?"rgba(30,26,50,.95)":"rgba(14,14,24,.9)";
+    ctx.fillRect(x,y,cw,hh);
+    ctx.strokeStyle=sel?f.color:"rgba(120,120,150,.35)"; ctx.lineWidth=sel?2.5:1;
+    ctx.strokeRect(x,y,cw,hh);
+    if(sel) glow(x+cw/2,y+hh/2,120,f.color,0.08);
+    ctx.fillStyle=f.color; ctx.font="bold 13px monospace";
+    ctx.fillText("["+(i+1)+"] "+f.name.split("·")[0].trim(),x+cw/2,y+22);
+    ctx.fillStyle="#a8a8bc"; ctx.font="10px monospace";
+    ctx.fillText(f.name.split("·")[1].trim(),x+cw/2,y+38);
+    ctx.fillStyle="#c8c8d8"; ctx.font="10px monospace";
+    f.desc.forEach((d,j)=>ctx.fillText(d,x+cw/2,y+62+j*16));
+    ctx.fillStyle="#666"; ctx.fillText("affinity: "+HOUSES.find(h=>h.affinity===f.key).name,x+cw/2,y+hh-10);
+  }
+  ctx.fillStyle="rgba(240,234,216,"+(0.6+0.4*pulse)+")"; ctx.font="bold 14px monospace";
+  ctx.fillText("Press 1 / 2 / 3 to choose your order  ·  ENTER or CLICK to enter the zone",W/2,556);
+  ctx.fillStyle="#555"; ctx.font="10px monospace";
+  ctx.fillText("WASD move · mouse aim flashlight · click/space shoot · E interact · F flashlight · N day/night · M map · R restart",W/2,580);
+}
+function renderEnd(title,body,color){
+  ctx.fillStyle="rgba(2,2,8,.78)"; ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle=color; ctx.font="bold 34px serif";
+  ctx.shadowColor=color; ctx.shadowBlur=20;
+  ctx.fillText(title,W/2,240); ctx.shadowBlur=0;
+  ctx.fillStyle=COL.bone; ctx.font="14px monospace";
+  ctx.fillText(body,W/2,286);
+  ctx.fillStyle="#aaa"; ctx.font="12px monospace";
+  ctx.fillText("Houses resolved: "+G.resolvedCount+"/3 · clues found: "+G.stats.clues+" · shots fired: "+G.stats.shots+" · mimics met: "+G.stats.mimics,W/2,322);
+  ctx.fillStyle="rgba(255,255,255,"+(0.5+0.5*Math.sin(G.time*3))+")"; ctx.font="bold 14px monospace";
+  ctx.fillText("Press R to return to the title",W/2,370);
+}
+
+/* ------------------------------ loop ------------------------------- */
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  if(G.state!==GameState.TITLE) update(dt); else G.time+=0; // title animates in renderTitle
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* -------- sanity checks on data (console only, non-fatal) ---------- */
+(function validate(){
+  for(const hDef of HOUSES){
+    if(hDef.map.length!==ROWS) console.warn(hDef.name,"bad row count");
+    hDef.map.forEach((r,i)=>{ if(r.length!==COLS) console.warn(hDef.name,"row",i,"len",r.length); });
+    const flat=hDef.map.join("");
+    const count=ch=>flat.split(ch).length-1;
+    if(count("C")!==3) console.warn(hDef.name,"clue count",count("C"));
+    ["T","W","M","D"].forEach(ch=>{ if(count(ch)!==1) console.warn(hDef.name,"marker",ch,count(ch)); });
+  }
+})();
+</script>
+</body>
+</html>
