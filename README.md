@@ -12,6 +12,14 @@ game — procedural wall textures, sprite monsters unique to each house, pointer
 look, a drawn revolver + torch viewmodel, heartbeat/drone audio, jump scares, film grain,
 and a field journal (J). Same rules, scarier room.
 
+**Asset bible build:** open `3d index test 2.html` for the same 3D game restyled to the
+Cursebound Asset Bible (Valheim × Silent Hill PS1): a 480×300 PS1 render buffer with hard
+pixels, banded lighting and dither; cracked-plaster/timber/wainscot walls with brick-damage
+and purple-sigil variants; the sealed exit is the blood-sigil ritual door; monsters,
+exorcist teammates, mimic (stitched-cross tell), crawling-hand familiar, and props are all
+recreated from their concept sheets. Press **V** on the title for an asset gallery that
+presents every recreated asset concept-sheet style.
+
 ## The loop
 
 1. Pick a faction on the title screen (Celtic, Assyrian, or Egyptian — each has a passive).
