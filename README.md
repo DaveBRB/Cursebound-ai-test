@@ -20,6 +20,12 @@ exorcist teammates, mimic (stitched-cross tell), crawling-hand familiar, and pro
 recreated from their concept sheets. Press **V** on the title for an asset gallery that
 presents every recreated asset concept-sheet style.
 
+**Free-look build:** open `3d index test 3.html` for the asset-bible build with a full FPS
+camera — 360° yaw plus pitch up/down (Build-engine horizon shear, **C** recenters) — and
+perspective-correct textured floors and ceilings cast per pixel: worn stained floorboards
+under dark plank ceilings indoors, mossy dirt ground outdoors. Adds footsteps and
+cross-braced village timberwork. Same gameplay, gallery included.
+
 ## The loop
 
 1. Pick a faction on the title screen (Celtic, Assyrian, or Egyptian — each has a passive).
