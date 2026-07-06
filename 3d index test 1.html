@@ -1,0 +1,1598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cursebound 3D — Houses of the Ancients (test 1)</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#020204;overflow:hidden}
+  #wrap{display:flex;align-items:center;justify-content:center;height:100%}
+  canvas{box-shadow:0 0 90px rgba(110,40,200,.33);border-radius:3px;cursor:crosshair}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="600"></canvas></div>
+<script>
+"use strict";
+/* =====================================================================
+   CURSEBOUND 3D — first-person raycast prototype ("3d index test 1")
+   One file. No libraries, no external assets. Every wall texture,
+   monster, hand, icon and sound is generated procedurally at boot.
+
+   Same design bible as the 2D prototype:
+     PURPLE = curse risk   RED = danger/sealed   BLUE = clue   GREEN = ward
+     Bullets stagger monsters. Knowledge resolves curses.
+   ===================================================================== */
+
+/* ------------------------------ consts ----------------------------- */
+const W=960, H=600, HALF=H/2;
+const FOV=1.15, NUM_RAYS=480, COLW=W/NUM_RAYS;   // 2px columns
+const GameState ={TITLE:0,WORLD:1,HOUSE:2,GAME_OVER:3,WIN:4};
+const CurseState={DORMANT:0,OMEN:1,SEAL:2,HUNT:3,DISTORTION:4,JUDGMENT:5,RESOLVED:6};
+const CURSE_NAME=["DORMANT","OMEN","SEAL","HUNT","DISTORTION","JUDGMENT","RESOLVED"];
+const CURSE_COL =["#8a8a9a","#b070e0","#e04040","#ff3030","#c040ff","#ffd040","#40e080"];
+const COL={purple:"#b060ff",red:"#ff3838",blue:"#5aa4ff",green:"#40e080",bone:"#d8d2c0"};
+
+const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+const lerp=(a,b,t)=>a+(b-a)*t;
+const dist2=(ax,ay,bx,by)=>Math.hypot(ax-bx,ay-by);
+function normAng(a){while(a>Math.PI)a-=2*Math.PI;while(a<-Math.PI)a+=2*Math.PI;return a;}
+function mulberry32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
+function hash2(x,y){return((x*73856093)^(y*19349663))>>>0;}
+function mkCanvas(w,h,fn){const c=document.createElement("canvas");c.width=w;c.height=h;fn(c.getContext("2d"),w,h);return c;}
+
+/* ------------------------------ audio ------------------------------ */
+const Sfx={
+  ctx:null,drone:null,
+  ensure(){ if(this.ctx) return;
+    try{ this.ctx=new (window.AudioContext||window.webkitAudioContext)(); this.startDrone(); }catch(e){} },
+  startDrone(){ // low double-saw dread pad, always underneath
+    const c=this.ctx,g=c.createGain(),f=c.createBiquadFilter();
+    f.type="lowpass"; f.frequency.value=170; g.gain.value=0.016;
+    [55,56.3].forEach(fr=>{ const o=c.createOscillator(); o.type="sawtooth"; o.frequency.value=fr; o.connect(f); o.start(); });
+    const lfo=c.createOscillator(), lg=c.createGain();
+    lfo.frequency.value=0.07; lg.gain.value=0.008; lfo.connect(lg); lg.connect(g.gain); lfo.start();
+    f.connect(g); g.connect(c.destination); this.drone=g; },
+  tone(f,d,type,g,slide){ this.ensure(); if(!this.ctx)return;
+    const c=this.ctx,o=c.createOscillator(),v=c.createGain();
+    o.type=type||"sine"; o.frequency.value=f;
+    if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(28,f+slide),c.currentTime+d);
+    v.gain.value=g||0.08; v.gain.exponentialRampToValueAtTime(0.0001,c.currentTime+d);
+    o.connect(v);v.connect(c.destination);o.start();o.stop(c.currentTime+d); },
+  noise(d,g,bp){ this.ensure(); if(!this.ctx)return;
+    const c=this.ctx,len=c.sampleRate*d,buf=c.createBuffer(1,len,c.sampleRate),ch=buf.getChannelData(0);
+    for(let i=0;i<len;i++)ch[i]=(Math.random()*2-1)*(1-i/len);
+    const s=c.createBufferSource(),v=c.createGain();v.gain.value=g||0.1;
+    s.buffer=buf;
+    if(bp){const f=c.createBiquadFilter();f.type="bandpass";f.frequency.value=bp;f.Q.value=2;s.connect(f);f.connect(v);}
+    else s.connect(v);
+    v.connect(c.destination);s.start(); },
+  shot(){this.noise(0.18,0.22);this.tone(120,0.14,"square",0.07,-80);},
+  blip(){this.tone(640,0.07,"triangle",0.05);},
+  clue(){this.tone(520,0.3,"sine",0.07,240);},
+  curse(){this.tone(110,1.2,"sawtooth",0.06,-70);},
+  seal(){this.tone(60,0.9,"square",0.1,-25);this.noise(0.4,0.1);},
+  growl(){this.tone(52,0.5,"sawtooth",0.1,30);},
+  ritual(){this.tone(523,1.2,"sine",0.07,262);this.tone(659,1.2,"sine",0.05,330);},
+  hurt(){this.tone(170,0.22,"square",0.1,-110);this.noise(0.15,0.12);},
+  mimic(){this.tone(950,0.6,"sawtooth",0.06,-760);},
+  whisper(){this.noise(0.5,0.045,1300);},
+  creak(){this.tone(95+Math.random()*60,0.5,"sawtooth",0.028,35);},
+  scream(){this.tone(780,0.65,"sawtooth",0.16,-560);this.tone(390,0.65,"square",0.09,-260);this.noise(0.5,0.14);},
+  thump(strong){this.tone(46,0.11,"sine",strong?0.3:0.18,-14);
+    setTimeout(()=>this.tone(40,0.1,"sine",strong?0.22:0.12,-10),120);}
+};
+
+/* --------------------------- faction data -------------------------- */
+const FACTIONS=[
+ {key:"CELTIC",name:"Celtic · Order of the Black Star",color:"#5fd8a0",
+  desc:["Druidic astrotech & fae thresholds.","+ Senses hidden doors & curse objects afar","+ Kit: extra battery cells"],
+  kit:{battery:35},hiddenRadius:6.0,purpleSense:true},
+ {key:"ASSYRIAN",name:"Assyrian · Star-Priests of the Ledger",color:"#e0a050",
+  desc:["Cuneiform contracts & demon ledgers.","+ Identifies false clues, slows hunters","+ Kit: bronze rounds (extra ammo)"],
+  kit:{ammo:4},hiddenRadius:2.5,monsterSlow:0.85,seesFake:true},
+ {key:"EGYPTIAN",name:"Egyptian · House of Duat",color:"#ffd45f",
+  desc:["Funerary tech, heart scales, solar rites.","+ Greater resolve, faster judgment rituals","+ Kit: extra natron salt"],
+  kit:{salt:1},hiddenRadius:2.5,resolveMax:130,ritualTime:3.2}
+];
+
+/* ---------------------------- house data ---------------------------
+   Same floorplans as the 2D prototype (24x15 tiles).
+   # wall · . floor · d inner door(open) · D exit door · F furniture
+   S salt · C clue · X false clue · T trigger · W ward · M monster · r danger · H hidden
+--------------------------------------------------------------------- */
+const HOUSES=[
+ {name:"Rowan Farm",curseType:"Threshold Curse",affinity:"CELTIC",
+  trigger:"carved toy horse",monster:"The Uninvited",
+  omen:"The hearth goes cold. Something has noticed you.",
+  clueTexts:["Child's drawing: a black door that isn't there",
+             "Rowan branch nailed above the threshold",
+             "Diary: 'We never invited it. It came through the walls.'"],
+  fakeClue:"Muddy bootprints... they lead nowhere. A false trail.",
+  ritual:"Guest-rite: stand in the green ward, lay the salt line, speak welcome.",
+  resolvedText:"The threshold accepts the guest-rite. Rowan Farm exhales.",
+  whispers:["...who invited you...","...the door that isn't...","...cold hearth, cold guest...","...knock, knock..."],
+  map:["########################",
+       "#.....#........#.......#",
+       "#.F.C.#..r..M..#..C..F.#",
+       "#.....#..r.....d.......#",
+       "#..S..d..r.....#...T...#",
+       "####d##..r..####H#######",
+       "#.....#..r.....#.......#",
+       "#..F..#..r.W...d...C...#",
+       "#.....#..r.....#...F...#",
+       "#..X..#..r.....#.......#",
+       "####d###..r..###########",
+       "#......................#",
+       "#..F........F.......F..#",
+       "#......................#",
+       "###########D############"]},
+ {name:"Clay Ledger House",curseType:"Debt Curse",affinity:"ASSYRIAN",
+  trigger:"cracked clay tablet",monster:"The Debt-Keeper",
+  omen:"Ink crawls across the walls, tallying what you owe.",
+  clueTexts:["Ledger page: 'Paid in grain. Owed in years.'",
+             "Bronze scale, one pan filled with teeth",
+             "Wax seal fragment bearing a name struck out"],
+  fakeClue:"A forged IOU — the arithmetic doesn't balance.",
+  ritual:"Balance the ledger: stand in the ward, offer salt, declare the debt paid.",
+  resolvedText:"The ledger balances. The Debt-Keeper closes its book.",
+  whispers:["...you owe...","...interest accrues...","...sign here...","...paid in years..."],
+  map:["########################",
+       "#........#.....#.......#",
+       "#..F..C..d..S..#..F.C..#",
+       "#........#.....d.......#",
+       "#####d########.#...X...#",
+       "#....#..T...#..#########",
+       "#.C..d......d..d.......#",
+       "#....#......#..#..W....#",
+       "######......#..#.......#",
+       "#rrrrd......#..#####d###",
+       "#r#..#......#..........#",
+       "#rM..########..##H##..##",
+       "#r...d.........d....F..#",
+       "#r...#.........#.......#",
+       "###########D############"]},
+ {name:"Widow's Hall",curseType:"Grief / Judgment Curse",affinity:"EGYPTIAN",
+  trigger:"uncovered funeral mirror",monster:"The Mourner",
+  omen:"Every clock in the hall stops at 2:17. Someone begins to weep.",
+  clueTexts:["Every mirror is covered — except the one you touched",
+             "A clock stopped at 2:17, wound backwards",
+             "Widow's letter: 'Weigh my heart. I kept it heavy on purpose.'"],
+  fakeClue:"A photograph of the family — but no one has faces.",
+  ritual:"Heart-weighing: kneel in the green ward with salt and let the scales judge.",
+  resolvedText:"The heart weighs true. The Mourner lifts her veil and is gone.",
+  whispers:["...2:17...","...weigh it...","...she still sets two plates...","...look in the glass..."],
+  map:["########################",
+       "#......#...r...#.......#",
+       "#..C...#...r.M.#...T...#",
+       "#......d...r...d.......#",
+       "#..F...#...r...#..F....#",
+       "###d####...r...####d####",
+       "#......#...r...#.......#",
+       "#..S...d...r...d...C...#",
+       "#......#...r...#...X...#",
+       "##H#####...r...#########",
+       "#......#...r...#.......#",
+       "#..F...d...W...d..C.F..#",
+       "#......#.......#.......#",
+       "#......#.......#.......#",
+       "###########D############"]}
+];
+const FURN_NAMES=["cupboard","dresser","old crate","bed frame","writing desk","shelf","chest","pantry"];
+
+/* --------------------------- village map --------------------------- */
+const VW=36,VH=26;
+const VILLAGE=(()=>{ // generated, so row lengths can never be wrong
+  const g=Array.from({length:VH},()=>Array(VW).fill("."));
+  for(let x=0;x<VW;x++){g[0][x]="#";g[VH-1][x]="#";}
+  for(let y=0;y<VH;y++){g[y][0]="#";g[y][VW-1]="#";}
+  const doors={};
+  const bld=(x,y,w,h,door,ch)=>{ for(let r=y;r<y+h;r++)for(let c=x;c<x+w;c++)g[r][c]=ch;
+    const dc=x+(w>>1), dr=y+h-1; g[dr][dc]=door; doors[door]={c:dc,r:dr}; };
+  bld(3,2,8,5,"1","w");   // Rowan Farm
+  bld(24,2,9,5,"2","w");  // Clay Ledger House
+  bld(24,17,9,6,"3","w"); // Widow's Hall
+  bld(6,15,7,5,"S","s");  // safehouse
+  const rng=mulberry32(4242), trees=[], crates=[];
+  const free=(c,r)=>g[r][c]==="."&&![".","#"].every(()=>false);
+  const nearDoor=(c,r)=>Object.values(doors).some(d=>Math.abs(d.c-c)<2&&Math.abs(d.r-r)<3);
+  for(let i=0;i<38;i++){ const c=2+Math.floor(rng()*(VW-4)), r=2+Math.floor(rng()*(VH-4));
+    if(free(c,r)&&!nearDoor(c,r)&&!trees.some(t=>Math.abs(t.x-c)<2&&Math.abs(t.y-r)<2))
+      trees.push({x:c+0.5,y:r+0.5,seed:i}); }
+  const kinds=["food","water","ammo","battery","salt","food","water","ammo","battery","salt","food","ammo"];
+  let placed=0,guard=0;
+  while(placed<kinds.length&&guard++<500){ const c=2+Math.floor(rng()*(VW-4)), r=2+Math.floor(rng()*(VH-4));
+    if(free(c,r)&&!nearDoor(c,r)&&!trees.some(t=>dist2(t.x,t.y,c+0.5,r+0.5)<1.4)
+       &&!crates.some(k=>dist2(k.x,k.y,c+0.5,r+0.5)<2)){
+      crates.push({x:c+0.5,y:r+0.5,kind:kinds[placed],taken:false}); placed++; } }
+  return {grid:g,doors,trees,crates};
+})();
+
+/* ----------------------------- textures ---------------------------- */
+const TEX={};
+(function makeTextures(){
+  const S=64, rng=mulberry32(99);
+  TEX.wallpaper=mkCanvas(S,S,(c)=>{
+    c.fillStyle="#262033";c.fillRect(0,0,S,S);
+    c.fillStyle="#2c2540";for(let x=0;x<S;x+=8)c.fillRect(x,0,3,S);
+    c.fillStyle="rgba(120,100,150,.12)";for(let x=4;x<S;x+=16)for(let y=6;y<S;y+=16)c.fillRect(x,y,2,2);
+    for(let i=0;i<5;i++){ c.fillStyle="rgba(10,8,6,"+(0.18+rng()*0.2)+")";
+      c.beginPath();c.ellipse(rng()*S,rng()*S,4+rng()*10,3+rng()*8,rng()*3,0,7);c.fill(); }
+    c.fillStyle="#17131f";c.fillRect(0,S-7,S,7);
+    c.fillStyle="rgba(255,255,255,.05)";c.fillRect(0,0,S,2);
+  });
+  TEX.crack=mkCanvas(S,S,(c)=>{
+    c.drawImage(TEX.wallpaper,0,0);
+    c.strokeStyle="rgba(180,240,200,.5)";c.lineWidth=1.6;c.beginPath();
+    let x=S/2-6,y=2;c.moveTo(x,y);
+    while(y<S-4){x+=(rng()-0.5)*10;y+=6+rng()*5;c.lineTo(x,y);}c.stroke();
+  });
+  TEX.plank=mkCanvas(S,S,(c)=>{
+    c.fillStyle="#33261a";c.fillRect(0,0,S,S);
+    for(let x=0;x<S;x+=10){c.fillStyle=(x/10)%2?"#3a2c1e":"#31251a";c.fillRect(x,0,10,S);
+      c.fillStyle="rgba(0,0,0,.5)";c.fillRect(x,0,1,S);}
+    for(let i=0;i<4;i++){c.fillStyle="rgba(20,12,6,.7)";c.beginPath();c.arc(rng()*S,rng()*S,1.6+rng()*1.6,0,7);c.fill();}
+    c.fillStyle="rgba(0,0,0,.35)";c.fillRect(0,S-5,S,5);
+  });
+  TEX.planksafe=mkCanvas(S,S,(c)=>{ c.drawImage(TEX.plank,0,0);
+    c.fillStyle="rgba(70,200,120,.1)";c.fillRect(0,0,S,S);
+    c.strokeStyle="rgba(90,230,140,.5)";c.lineWidth=2;
+    c.beginPath();c.arc(S/2,20,7,0,7);c.stroke();
+    c.beginPath();c.moveTo(S/2,13);c.lineTo(S/2,27);c.moveTo(S/2-7,20);c.lineTo(S/2+7,20);c.stroke();
+  });
+  TEX.stone=mkCanvas(S,S,(c)=>{
+    c.fillStyle="#26282e";c.fillRect(0,0,S,S);
+    for(let y=0;y<S;y+=16)for(let x=0;x<S;x+=16){
+      const o=(y/16)%2?8:0;
+      c.fillStyle="rgba("+(34+rng()*14)+","+(36+rng()*14)+","+(44+rng()*12)+",1)";
+      c.fillRect((x+o)%S,y,15,15);}
+    c.fillStyle="rgba(0,0,0,.4)";for(let y=15;y<S;y+=16)c.fillRect(0,y,S,2);
+  });
+  TEX.door=mkCanvas(S,S,(c)=>{
+    c.fillStyle="#1c1208";c.fillRect(0,0,S,S);
+    c.fillStyle="#3d2a14";c.fillRect(5,3,S-10,S-5);
+    for(let x=9;x<S-8;x+=10){c.fillStyle="rgba(0,0,0,.4)";c.fillRect(x,4,1,S-8);}
+    c.fillStyle="#c8a860";c.beginPath();c.arc(S-14,S/2,3,0,7);c.fill();
+    c.fillStyle="rgba(0,0,0,.5)";c.fillRect(5,3,S-10,3);
+  });
+  TEX.sealed=mkCanvas(S,S,(c)=>{
+    c.drawImage(TEX.door,0,0);
+    c.fillStyle="rgba(60,0,0,.45)";c.fillRect(0,0,S,S);
+    c.shadowColor="#ff2020";c.shadowBlur=6;
+    c.fillStyle="#ff2828";
+    for(let i=0;i<3;i++)c.fillRect(2,10+i*17,S-4,4);
+    c.shadowBlur=0;
+    c.strokeStyle="rgba(255,60,60,.8)";c.lineWidth=2;
+    c.beginPath();c.moveTo(10,6);c.lineTo(30,26);c.moveTo(30,6);c.lineTo(12,30);c.stroke();
+  });
+  TEX.doorGreen=mkCanvas(S,S,(c)=>{ c.drawImage(TEX.door,0,0);
+    c.fillStyle="rgba(40,220,120,.16)";c.fillRect(0,0,S,S); });
+})();
+
+/* ----------------------------- sprites ----------------------------- */
+/* Every entity is a procedurally painted canvas billboard. Glows are
+   baked into the canvas so occlusion works per column. */
+const SPR={};
+(function makeSprites(){
+  const halo=(c,x,y,r,col,a)=>{const g=c.createRadialGradient(x,y,0,x,y,r);
+    g.addColorStop(0,col);g.addColorStop(1,"rgba(0,0,0,0)");
+    c.save();c.globalAlpha=a;c.globalCompositeOperation="lighter";c.fillStyle=g;
+    c.beginPath();c.arc(x,y,r,0,7);c.fill();c.restore();};
+
+  /* -- monsters: two animation frames each + a jumpscare face -- */
+  function uninvited(f){ return mkCanvas(96,176,(c)=>{
+    halo(c,48,80,60,"rgba(255,30,30,0.5)",0.35);
+    c.fillStyle="#050507";
+    // tapered body
+    c.beginPath();c.moveTo(38,40);c.lineTo(58,40);c.lineTo(66,176);c.lineTo(30,176);c.closePath();c.fill();
+    // long arms, frame-dependent
+    c.strokeStyle="#050507";c.lineWidth=7;c.lineCap="round";
+    c.beginPath();c.moveTo(40,52);c.quadraticCurveTo(14,90,10+(f?6:0),150);c.stroke();
+    c.beginPath();c.moveTo(56,52);c.quadraticCurveTo(84,92,88-(f?6:0),148);c.stroke();
+    // twig antlers
+    c.strokeStyle="#0d0b08";c.lineWidth=3;
+    for(let i=0;i<3;i++){c.beginPath();c.moveTo(42+i*6,26);
+      c.lineTo(34+i*10+(f?2:-2),4+i*3);c.stroke();}
+    // pale face
+    c.fillStyle="#cfc7b8";c.beginPath();c.ellipse(48,30,11,15,0,0,7);c.fill();
+    c.fillStyle="#000";
+    c.beginPath();c.ellipse(44,26,2.6,4.5,0,0,7);c.fill();
+    c.beginPath();c.ellipse(53,26,2.6,4.5,0,0,7);c.fill();
+    c.beginPath();c.ellipse(48,40,3,6,0,0,7);c.fill(); // long open mouth
+  });}
+  function debtkeeper(f){ return mkCanvas(112,160,(c)=>{
+    halo(c,56,70,62,"rgba(255,120,20,0.5)",0.3);
+    // hunched bulk
+    c.fillStyle="#120c08";
+    c.beginPath();c.moveTo(20,160);c.quadraticCurveTo(10,70,56,44);c.quadraticCurveTo(102,70,92,160);c.closePath();c.fill();
+    // hanging tally strips
+    c.strokeStyle="#2a1c0e";c.lineWidth=4;
+    for(let i=0;i<6;i++){const x=26+i*12;c.beginPath();c.moveTo(x,86);c.lineTo(x+(f?2:-2),128+((i*13)%18));c.stroke();}
+    // bronze mask
+    c.fillStyle="#8a6a2a";c.beginPath();c.ellipse(56,40,17,20,0,0,7);c.fill();
+    c.fillStyle="#c8a850";c.beginPath();c.ellipse(56,38,13,15,0,0,7);c.fill();
+    c.fillStyle="#180c00";c.fillRect(46,32,8,3);c.fillRect(60,32,8,3); // slit eyes
+    c.shadowColor="#ffb030";c.shadowBlur=8;c.fillStyle="#ffb030";
+    c.fillRect(47,33,6,1.6);c.fillRect(61,33,6,1.6);c.shadowBlur=0;
+    // engraved mouth grid
+    c.strokeStyle="#241400";c.lineWidth=1.4;
+    for(let i=0;i<4;i++){c.beginPath();c.moveTo(48,46+i*2.4);c.lineTo(64,46+i*2.4);c.stroke();}
+    // claw with tablet
+    c.fillStyle="#0e0a06";c.beginPath();
+    c.moveTo(88,92);c.lineTo(108,80+(f?6:0));c.lineTo(104,100);c.closePath();c.fill();
+    c.fillStyle="#6a5432";c.fillRect(92,92,16,22);
+    c.strokeStyle="#241a08";for(let i=0;i<4;i++){c.beginPath();c.moveTo(94,96+i*5);c.lineTo(106,96+i*5);c.stroke();}
+  });}
+  function mourner(f){ return mkCanvas(96,168,(c)=>{
+    halo(c,48,70,58,"rgba(200,60,255,0.45)",0.3);
+    // floating veiled figure, tattered hem, no legs
+    c.fillStyle="#0a0a10";
+    c.beginPath();c.moveTo(24,30);c.quadraticCurveTo(48,6,72,30);
+    c.lineTo(78,120);
+    for(let i=0;i<6;i++)c.lineTo(72-i*8,132+((i%2)?(f?10:2):(f?2:10)));
+    c.lineTo(18,120);c.closePath();c.fill();
+    // veil sheen
+    c.strokeStyle="rgba(150,140,180,.25)";c.lineWidth=2;
+    c.beginPath();c.moveTo(30,34);c.quadraticCurveTo(48,20,66,34);c.stroke();
+    c.beginPath();c.moveTo(28,52);c.quadraticCurveTo(48,42,68,52);c.stroke();
+    // the face under the veil is BLANK
+    c.fillStyle="#1a1520";c.beginPath();c.ellipse(48,40,10,13,0,0,7);c.fill();
+    // clasped pale hands
+    c.fillStyle="#b8aca0";c.beginPath();c.ellipse(48,86,7,9,0,0,7);c.fill();
+    c.strokeStyle="#8a7c70";c.lineWidth=1;
+    for(let i=0;i<4;i++){c.beginPath();c.moveTo(43+i*3,80);c.lineTo(44+i*3,92);c.stroke();}
+  });}
+  SPR.monsters=[[uninvited(0),uninvited(1)],[debtkeeper(0),debtkeeper(1)],[mourner(0),mourner(1)]];
+  SPR.monsterH=[1.15,1.0,1.1]; // world height in tiles
+
+  /* jumpscare faces */
+  SPR.faces=[
+    mkCanvas(200,200,(c)=>{ c.fillStyle="#cfc7b8";c.beginPath();c.ellipse(100,100,62,84,0,0,7);c.fill();
+      c.fillStyle="#000";
+      c.beginPath();c.ellipse(76,84,14,24,0,0,7);c.fill();
+      c.beginPath();c.ellipse(126,84,14,24,0,0,7);c.fill();
+      c.beginPath();c.ellipse(100,150,18,32,0,0,7);c.fill();
+      c.strokeStyle="#0d0b08";c.lineWidth=7;
+      for(let i=0;i<4;i++){c.beginPath();c.moveTo(60+i*24,24);c.lineTo(46+i*30,-8);c.stroke();} }),
+    mkCanvas(200,200,(c)=>{ c.fillStyle="#8a6a2a";c.beginPath();c.ellipse(100,100,80,92,0,0,7);c.fill();
+      c.fillStyle="#c8a850";c.beginPath();c.ellipse(100,96,64,74,0,0,7);c.fill();
+      c.fillStyle="#180c00";c.fillRect(52,74,38,12);c.fillRect(112,74,38,12);
+      c.shadowColor="#ffb030";c.shadowBlur=18;c.fillStyle="#ffb030";
+      c.fillRect(56,78,30,5);c.fillRect(116,78,30,5);c.shadowBlur=0;
+      c.strokeStyle="#241400";c.lineWidth=4;
+      for(let i=0;i<6;i++){c.beginPath();c.moveTo(62,124+i*8);c.lineTo(140,124+i*8);c.stroke();} }),
+    mkCanvas(200,200,(c)=>{ c.fillStyle="#0a0a10";c.beginPath();c.ellipse(100,100,84,96,0,0,7);c.fill();
+      c.strokeStyle="rgba(150,140,180,.3)";c.lineWidth=5;
+      c.beginPath();c.moveTo(30,70);c.quadraticCurveTo(100,30,170,70);c.stroke();
+      c.beginPath();c.moveTo(26,110);c.quadraticCurveTo(100,80,174,110);c.stroke();
+      c.fillStyle="#1a1520";c.beginPath();c.ellipse(100,104,48,62,0,0,7);c.fill(); })
+  ];
+
+  /* teammates */
+  SPR.mate=mkCanvas(56,104,(c)=>{
+    c.fillStyle="rgba(0,0,0,.35)";c.beginPath();c.ellipse(28,100,16,4,0,0,7);c.fill();
+    c.fillStyle="#31435c";c.beginPath(); // cloak
+    c.moveTo(14,38);c.quadraticCurveTo(28,26,42,38);c.lineTo(46,98);c.lineTo(10,98);c.closePath();c.fill();
+    c.fillStyle="#22303f";c.beginPath();c.arc(28,26,12,0,7);c.fill(); // hood
+    c.fillStyle="#0c0f14";c.beginPath();c.ellipse(28,28,7,8,0,0,7);c.fill(); // shadowed face
+    c.fillStyle="#c8b890";c.beginPath();c.ellipse(28,31,4,3,0,0,7);c.fill(); // chin
+    c.fillStyle="#e8c860";c.fillRect(40,58,5,9); // little lantern
+    halo(c,42,62,12,"rgba(255,220,120,.7)",0.5);
+  });
+  SPR.mimicTell=mkCanvas(56,104,(c)=>{ c.drawImage(SPR.mate,0,0);
+    c.strokeStyle="rgba(255,40,40,.55)";c.lineWidth=2.5;
+    c.strokeRect(6,10,44,90);
+    c.fillStyle="rgba(255,30,30,.16)";c.fillRect(6,10,44,90); });
+
+  /* interactables */
+  SPR.triggers=[
+    mkCanvas(64,64,(c)=>{ halo(c,32,32,28,"rgba(176,96,255,.8)",0.6);
+      c.fillStyle="#b060ff";c.fillRect(18,28,22,12);c.fillRect(34,16,9,14);
+      c.strokeStyle="#d8b8ff";c.lineWidth=2.5;
+      c.beginPath();c.arc(28,44,14,0.15*Math.PI,0.85*Math.PI);c.stroke(); }),
+    mkCanvas(64,64,(c)=>{ halo(c,32,32,28,"rgba(176,96,255,.8)",0.6);
+      c.fillStyle="#a070d8";c.fillRect(18,12,28,40);
+      c.strokeStyle="#2a1440";for(let i=0;i<5;i++){c.beginPath();c.moveTo(23,19+i*7);c.lineTo(41,19+i*7);c.stroke();}
+      c.strokeStyle="#e8d0ff";c.lineWidth=2;c.beginPath();c.moveTo(18,40);c.lineTo(46,24);c.stroke(); }),
+    mkCanvas(64,64,(c)=>{ halo(c,32,32,28,"rgba(176,96,255,.8)",0.6);
+      c.fillStyle="#b060ff";c.beginPath();c.ellipse(32,32,13,20,0,0,7);c.fill();
+      c.fillStyle="#e8e0f8";c.beginPath();c.ellipse(28,26,3,9,0.4,0,7);c.fill(); })
+  ];
+  SPR.clue=mkCanvas(48,48,(c)=>{ halo(c,24,24,22,"rgba(90,164,255,.9)",0.7);
+    c.save();c.translate(24,24);c.rotate(Math.PI/4);c.fillStyle="#7ab8ff";c.fillRect(-7,-7,14,14);c.restore();
+    c.fillStyle="#fff";c.fillRect(22,10,3,3); });
+  SPR.salt=mkCanvas(40,40,(c)=>{ halo(c,20,22,16,"rgba(255,255,255,.7)",0.4);
+    c.fillStyle="#eae6da";c.beginPath();c.moveTo(20,6);c.lineTo(32,32);c.lineTo(8,32);c.closePath();c.fill(); });
+  SPR.furn=mkCanvas(72,72,(c)=>{
+    c.fillStyle="#3a2c1a";c.fillRect(8,18,56,50);
+    c.fillStyle="#493a24";c.fillRect(12,22,48,20);c.fillRect(12,46,48,18);
+    c.fillStyle="#c8a860";c.fillRect(33,30,6,4);c.fillRect(33,52,6,4);
+    c.fillStyle="rgba(255,255,255,.06)";c.fillRect(8,18,56,5); });
+  SPR.furnOpen=mkCanvas(72,72,(c)=>{ c.drawImage(SPR.furn,0,0);
+    c.fillStyle="rgba(0,0,0,.65)";c.fillRect(12,22,48,20);c.fillRect(12,46,48,18); });
+  SPR.ward=mkCanvas(96,96,(c)=>{ halo(c,48,60,42,"rgba(70,230,140,.8)",0.5);
+    c.strokeStyle="#46e68c";c.lineWidth=3;c.setLineDash([8,6]);
+    c.beginPath();c.ellipse(48,62,36,14,0,0,7);c.stroke();c.setLineDash([]);
+    c.lineWidth=1.6;c.beginPath();c.ellipse(48,62,20,8,0,0,7);c.stroke();
+    for(let i=0;i<6;i++){const a=i/6*Math.PI*2;
+      c.fillStyle="#46e68c";c.fillRect(48+Math.cos(a)*28-1.5,62+Math.sin(a)*11-5,3,7);} });
+  SPR.rune=mkCanvas(32,32,(c)=>{ halo(c,16,16,14,"rgba(255,40,40,.8)",0.5);
+    c.strokeStyle="#ff4040";c.lineWidth=2.4;
+    c.beginPath();c.moveTo(16,4);c.lineTo(26,26);c.lineTo(6,26);c.closePath();c.stroke();
+    c.beginPath();c.moveTo(16,12);c.lineTo(16,20);c.stroke(); });
+  SPR.crate=mkCanvas(56,56,(c)=>{
+    c.fillStyle="#4a3a22";c.fillRect(8,14,40,36);
+    c.strokeStyle="#6a5432";c.lineWidth=3;c.strokeRect(8,14,40,36);
+    c.beginPath();c.moveTo(8,14);c.lineTo(48,50);c.moveTo(48,14);c.lineTo(8,50);c.stroke(); });
+  SPR.tree=(seed)=>mkCanvas(96,192,(c)=>{
+    const r=mulberry32(seed);
+    c.strokeStyle="#0d0a08";c.lineWidth=9;c.lineCap="round";
+    c.beginPath();c.moveTo(48,192);c.quadraticCurveTo(44+r()*8,110,48,70);c.stroke();
+    c.lineWidth=4;
+    for(let i=0;i<6;i++){ c.beginPath();c.moveTo(48,80+i*14);
+      c.quadraticCurveTo(48+(r()-0.5)*60,66+i*12,48+(r()-0.5)*88,50+i*10);c.stroke(); }
+    c.fillStyle="rgba(10,16,10,.85)";
+    for(let i=0;i<7;i++){c.beginPath();c.arc(26+r()*44,30+r()*50,14+r()*16,0,7);c.fill();}
+  });
+  SPR.trees=VILLAGE.trees.map(t=>SPR.tree(t.seed));
+})();
+
+/* ------------------------------ input ------------------------------ */
+const keys={};
+const canvas=document.getElementById("game"), ctx=canvas.getContext("2d");
+function fitCanvas(){ const s=Math.min(window.innerWidth/W,window.innerHeight/H);
+  canvas.style.width=(W*s)+"px"; canvas.style.height=(H*s)+"px"; }
+window.addEventListener("resize",fitCanvas); fitCanvas();
+
+let pointerLocked=false;
+document.addEventListener("pointerlockchange",()=>{ pointerLocked=document.pointerLockElement===canvas; });
+canvas.addEventListener("mousemove",e=>{
+  if(pointerLocked&&G&&(G.state===GameState.WORLD||G.state===GameState.HOUSE))
+    G.player.dir+=e.movementX*0.0021;
+});
+canvas.addEventListener("mousedown",()=>{
+  Sfx.ensure();
+  if(G.state===GameState.TITLE){ startGame(); canvas.requestPointerLock(); return; }
+  if(!pointerLocked&&(G.state===GameState.WORLD||G.state===GameState.HOUSE)){ canvas.requestPointerLock(); return; }
+  tryShoot();
+});
+window.addEventListener("keydown",e=>{
+  const k=e.key.toLowerCase();
+  if(["arrowup","arrowdown","arrowleft","arrowright"," "].includes(k)) e.preventDefault();
+  if(keys[k]) return; keys[k]=true; Sfx.ensure();
+  if(G.state===GameState.TITLE){
+    if(k==="1"||k==="2"||k==="3"){G.factionIdx=+k-1;Sfx.blip();}
+    if(k==="enter") startGame();
+  } else {
+    if(k==="e") interact();
+    if(k==="f"){G.flashlight=!G.flashlight;Sfx.blip();}
+    if(k==="n"){G.night=!G.night;G.log(G.night?"Night falls. The purple light deepens.":"A gray, unwilling dawn.",G.night?COL.purple:"#ccc");}
+    if(k==="m"){G.showMap=!G.showMap;G.showJournal=false;}
+    if(k==="j"){G.showJournal=!G.showJournal;G.showMap=false;}
+    if(k===" ") tryShoot();
+  }
+  if(k==="r") resetGame();
+});
+window.addEventListener("keyup",e=>keys[e.key.toLowerCase()]=false);
+
+/* --------------------------- game object --------------------------- */
+let G=null;
+function resetGame(){
+  if(document.pointerLockElement) document.exitPointerLock();
+  const sd=VILLAGE.doors["S"];
+  G={
+    state:GameState.TITLE,factionIdx:0,time:0,night:true,
+    flashlight:true,showMap:false,showJournal:false,
+    shake:0,dmgFlash:0,greenFlash:0,jump:0,jumpFace:0,flicker:1,
+    player:{x:sd.c+0.5,y:sd.r+2.2,dir:-Math.PI/2,r:0.26,
+      hp:100,hpMax:100,sta:100,res:100,resMax:100,
+      hunger:0,thirst:0,battery:100,batteryMax:100,
+      inv:{food:2,water:2,ammo:6,salt:1},hitCd:0,shotCd:0,bob:0,recoil:0},
+    mates:[{name:"Bren",x:sd.c-0.6,y:sd.r+3.0,r:0.22,distract:0,target:null,farT:0},
+           {name:"Sahar",x:sd.c+1.6,y:sd.r+3.0,r:0.22,distract:0,target:null,farT:0}],
+    whispers:[],logs:[],
+    houseIdx:-1,house:null,houseInst:[null,null,null],resolvedCount:0,
+    mimicCd:8,channel:0,channeling:false,hiddenSeen:false,
+    hbT:0,creakT:6,staggerTip:false,
+    stats:{shots:0,clues:0,mimics:0},overCause:"",
+    log(text,color){this.logs.push({text,color:color||COL.bone,t:0});if(this.logs.length>6)this.logs.shift();}
+  };
+}
+resetGame();
+const faction=()=>FACTIONS[G.factionIdx];
+function startGame(){
+  const f=faction(),p=G.player;
+  p.resMax=f.resolveMax||100;p.res=p.resMax;
+  if(f.kit.ammo)p.inv.ammo+=f.kit.ammo;
+  if(f.kit.salt)p.inv.salt+=f.kit.salt;
+  if(f.kit.battery){p.batteryMax=135;p.battery=135;}
+  G.state=GameState.WORLD;
+  G.log("The exclusion zone. Three houses hold curses — resolve all three.",COL.purple);
+  G.log("Click to capture the mouse. Purple wakes curses; knowledge ends them.","#999");
+}
+
+/* -------------------------- house instance ------------------------- */
+const HROWS=15,HCOLS=24;
+function makeHouseInstance(id){
+  const def=HOUSES[id];
+  const tiles=def.map.map(r=>r.split(""));
+  const inst={id,def,tiles,curse:CurseState.DORMANT,curseT:0,
+    clues:[],furniture:[],salts:[],hidden:[],danger:[],dangerSet:new Set(),
+    trigger:null,ward:null,mSpawn:null,exit:null,
+    cluesFound:0,monster:null,mimic:null,resolved:false,
+    whisperT:3,preState:CurseState.HUNT,scared:false};
+  for(let r=0;r<HROWS;r++)for(let c=0;c<HCOLS;c++){
+    const ch=tiles[r][c],x=c+0.5,y=r+0.5;
+    switch(ch){
+      case"C":inst.clues.push({x,y,fake:false,taken:false,idx:inst.clues.filter(q=>!q.fake).length});tiles[r][c]=".";break;
+      case"X":inst.clues.push({x,y,fake:true,taken:false});tiles[r][c]=".";break;
+      case"F":inst.furniture.push({x,y,looted:false,kind:FURN_NAMES[hash2(c,r)%FURN_NAMES.length]});tiles[r][c]=".";break;
+      case"S":inst.salts.push({x,y,taken:false});tiles[r][c]=".";break;
+      case"T":inst.trigger={x,y,used:false};tiles[r][c]=".";break;
+      case"W":inst.ward={x,y,r:1.6};tiles[r][c]=".";break;
+      case"M":inst.mSpawn={x,y};tiles[r][c]=".";break;
+      case"H":inst.hidden.push({c,r,opened:false,seen:false});break;
+      case"D":inst.exit={c,r,sealed:false};break;
+      case"r":inst.danger.push({x,y});inst.dangerSet.add(c+","+r);tiles[r][c]=".";break;
+      case"d":tiles[r][c]=".";break; // inner doors are open archways in 3D
+    }
+  }
+  return inst;
+}
+
+/* --------------------------- grid helpers -------------------------- */
+function gridAt(c,r){
+  if(G.state===GameState.HOUSE){
+    const inst=G.house;
+    if(c<0||r<0||c>=HCOLS||r>=HROWS)return"#";
+    return inst.tiles[r][c];
+  }
+  if(c<0||r<0||c>=VW||r>=VH)return"#";
+  return VILLAGE.grid[r][c];
+}
+function isSolid(c,r){
+  const ch=gridAt(c,r);
+  if(G.state===GameState.HOUSE){
+    const inst=G.house;
+    if(ch==="#")return true;
+    if(ch==="H"){const hd=inst.hidden.find(h=>h.c===c&&h.r===r);return hd?!hd.opened:true;}
+    if(ch==="D")return true; // door tile is a wall; E opens/uses it
+    return false;
+  }
+  return ch!=="."; // village: everything except ground is solid (walls, doors)
+}
+function entColl(x,y,rad){
+  const c0=Math.floor(x-rad),c1=Math.floor(x+rad),r0=Math.floor(y-rad),r1=Math.floor(y+rad);
+  for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++){
+    if(isSolid(c,r)){
+      const nx=clamp(x,c,c+1),ny=clamp(y,r,r+1);
+      if(Math.hypot(x-nx,y-ny)<rad)return true;
+    }
+  }
+  if(G.state===GameState.WORLD)
+    for(const t of VILLAGE.trees) if(dist2(t.x,t.y,x,y)<rad+0.3)return true;
+  return false;
+}
+function moveEnt(e,dx,dy){
+  if(dx&&!entColl(e.x+dx,e.y,e.r))e.x+=dx;
+  if(dy&&!entColl(e.x,e.y+dy,e.r))e.y+=dy;
+}
+
+/* ----------------------------- raycasting -------------------------- */
+function castRay(px,py,ang){
+  const sin=Math.sin(ang),cos=Math.cos(ang);
+  let mc=Math.floor(px),mr=Math.floor(py);
+  const dX=Math.abs(1/(cos||1e-9)),dY=Math.abs(1/(sin||1e-9));
+  let stepX,stepY,sideX,sideY;
+  if(cos<0){stepX=-1;sideX=(px-mc)*dX;}else{stepX=1;sideX=(mc+1-px)*dX;}
+  if(sin<0){stepY=-1;sideY=(py-mr)*dY;}else{stepY=1;sideY=(mr+1-py)*dY;}
+  let side=0,guard=0;
+  while(guard++<80){
+    if(sideX<sideY){sideX+=dX;mc+=stepX;side=0;}
+    else{sideY+=dY;mr+=stepY;side=1;}
+    if(isSolid(mc,mr))break;
+  }
+  const d=side===0?sideX-dX:sideY-dY;
+  let wallX=side===0?py+d*sin:px+d*cos;
+  wallX-=Math.floor(wallX);
+  return {dist:Math.max(0.02,d),texX:wallX,ch:gridAt(mc,mr),side,mc,mr};
+}
+function wallTexFor(ch,mc,mr){
+  if(G.state===GameState.HOUSE){
+    const inst=G.house;
+    if(ch==="D")return inst.curse===CurseState.RESOLVED?TEX.doorGreen:(inst.exit.sealed?TEX.sealed:TEX.door);
+    if(ch==="H"){const hd=inst.hidden.find(h=>h.c===mc&&h.r===mr);return hd&&hd.seen?TEX.crack:TEX.wallpaper;}
+    return TEX.wallpaper;
+  }
+  if(ch==="w")return TEX.plank;
+  if(ch==="s")return TEX.planksafe;
+  if(ch==="1"||ch==="2"||ch==="3"){const inst=G.houseInst[+ch-1];return inst&&inst.resolved?TEX.doorGreen:TEX.door;}
+  if(ch==="S")return TEX.doorGreen;
+  return TEX.stone;
+}
+
+/* line of sight for hitscan / AI */
+function losBlocked(ax,ay,bx,by){
+  const d=dist2(ax,ay,bx,by),ang=Math.atan2(by-ay,bx-ax);
+  return castRay(ax,ay,ang).dist<d-0.15;
+}
+
+/* ------------------------------ combat ----------------------------- */
+function tryShoot(){
+  if(G.state!==GameState.WORLD&&G.state!==GameState.HOUSE)return;
+  const p=G.player;
+  if(p.shotCd>0)return;
+  if(p.inv.ammo<=0){G.log("Click. The cylinder is empty.","#888");p.shotCd=0.35;return;}
+  p.inv.ammo--;p.shotCd=0.3;p.recoil=1;G.stats.shots++;G.shake=Math.max(G.shake,4);
+  Sfx.shot();
+  if(G.channeling){G.channeling=false;G.channel=0;G.log("The gunshot shatters your ritual focus.",COL.red);}
+  if(G.state!==GameState.HOUSE)return;
+  const inst=G.house;
+  const targets=[];
+  if(inst.monster)targets.push({e:inst.monster,type:"monster",hw:0.45});
+  if(inst.mimic&&inst.mimic.dissolve<=0)targets.push({e:inst.mimic,type:"mimic",hw:0.3});
+  let best=null;
+  for(const t of targets){
+    const d=dist2(p.x,p.y,t.e.x,t.e.y);
+    const a=Math.abs(normAng(Math.atan2(t.e.y-p.y,t.e.x-p.x)-p.dir));
+    if(a<Math.atan2(t.hw,d)&&!losBlocked(p.x,p.y,t.e.x,t.e.y))
+      if(!best||d<best.d)best={t,d};
+  }
+  if(!best)return;
+  if(best.t.type==="monster"){
+    const M=best.t.e;
+    M.stagger=1.15;
+    const a=Math.atan2(M.y-p.y,M.x-p.x);
+    moveEnt(M,Math.cos(a)*0.5,Math.sin(a)*0.5);
+    if(!G.staggerTip){G.staggerTip=true;G.log("It staggers — but lead won't lift a curse.","#e08040");}
+    Sfx.growl();
+  } else {
+    const mk=best.t.e;
+    if(mk.reveal<1){mk.reveal=1.05;G.log("The bullet passes clean through. That is NOT "+mk.name+".",COL.red);Sfx.mimic();}
+  }
+}
+
+/* ---------------------------- interaction -------------------------- */
+function facing(x,y){ // is the player looking roughly at this point?
+  const p=G.player;
+  return Math.abs(normAng(Math.atan2(y-p.y,x-p.x)-p.dir))<0.7;
+}
+function nearestInteractable(){
+  const p=G.player,R=1.35;
+  if(G.state===GameState.WORLD){
+    for(const [ch,d] of Object.entries(VILLAGE.doors)){
+      const dx=d.c+0.5,dy=d.r+0.5;
+      if(dist2(p.x,p.y,dx,dy)<R+0.4&&facing(dx,dy)){
+        if(ch==="S")return{type:"rest",label:"Rest & eat at the Safehouse (1 food, 1 water)"};
+        const id=+ch-1,inst=G.houseInst[id];
+        if(inst&&inst.resolved)return{type:"resolvedHouse",label:HOUSES[id].name+" is quiet now"};
+        return{type:"enterHouse",label:"Enter "+HOUSES[id].name,id};
+      }
+    }
+    for(const c of VILLAGE.crates)
+      if(!c.taken&&dist2(p.x,p.y,c.x,c.y)<R&&facing(c.x,c.y))return{type:"crate",label:"Open supply crate",c};
+    return null;
+  }
+  if(G.state===GameState.HOUSE){
+    const inst=G.house;
+    const ex={x:inst.exit.c+0.5,y:inst.exit.r+0.5};
+    if(dist2(p.x,p.y,ex.x,ex.y)<R+0.4&&facing(ex.x,ex.y)){
+      if(inst.exit.sealed)return{type:"sealed",label:"The door is SEALED by the curse"};
+      return{type:"exit",label:"Leave "+inst.def.name};
+    }
+    for(const hd of inst.hidden){
+      if(hd.opened)continue;
+      const hx=hd.c+0.5,hy=hd.r+0.5;
+      if(hd.seen&&dist2(p.x,p.y,hx,hy)<R+0.3&&facing(hx,hy))return{type:"hidden",label:"Force the hidden door",hd};
+    }
+    if(inst.ward&&dist2(p.x,p.y,inst.ward.x,inst.ward.y)<inst.ward.r&&inst.curse>=CurseState.SEAL&&inst.curse<CurseState.RESOLVED){
+      if(inst.cluesFound>=3&&p.inv.salt>=1)return{type:"ritual",label:"Perform the ritual (hold your ground!)"};
+      if(inst.cluesFound<3)return{type:"noritual",label:"The ward hums… you need "+(3-inst.cluesFound)+" more clue(s)"};
+      return{type:"noritual",label:"The ward hums… you need salt for the rite"};
+    }
+    if(inst.curse>=CurseState.OMEN)
+      for(const cl of inst.clues)
+        if(!cl.taken&&dist2(p.x,p.y,cl.x,cl.y)<R&&facing(cl.x,cl.y))
+          return{type:"clue",label:cl.fake&&faction().seesFake?"Examine clue (FORGED — Assyrian eye)":"Examine clue",cl};
+    if(inst.trigger&&!inst.trigger.used&&dist2(p.x,p.y,inst.trigger.x,inst.trigger.y)<R&&facing(inst.trigger.x,inst.trigger.y))
+      return{type:"trigger",label:"Touch the "+inst.def.trigger+"  ⚠ CURSE RISK",t:inst.trigger};
+    for(const s of inst.salts)
+      if(!s.taken&&dist2(p.x,p.y,s.x,s.y)<R&&facing(s.x,s.y))return{type:"salt",label:"Take the salt cache",s};
+    for(const f of inst.furniture)
+      if(!f.looted&&dist2(p.x,p.y,f.x,f.y)<R&&facing(f.x,f.y))return{type:"furn",label:"Search the "+f.kind,f};
+    return null;
+  }
+  return null;
+}
+function interact(){
+  const it=nearestInteractable();if(!it)return;
+  const p=G.player,inst=G.house;
+  switch(it.type){
+    case"enterHouse":enterHouse(it.id);break;
+    case"rest":
+      if(p.inv.food>=1&&p.inv.water>=1){
+        p.inv.food--;p.inv.water--;
+        p.hp=clamp(p.hp+50,0,p.hpMax);p.sta=100;p.res=clamp(p.res+30,0,p.resMax);
+        p.hunger=clamp(p.hunger-60,0,100);p.thirst=clamp(p.thirst-60,0,100);
+        G.log("You rest at the safehouse. Wounds close, nerves settle.",COL.green);Sfx.ritual();
+      } else G.log("You need 1 food and 1 water to rest.","#aaa");
+      break;
+    case"crate":{
+      it.c.taken=true;const k=it.c.kind;
+      if(k==="battery"){p.battery=clamp(p.battery+40,0,p.batteryMax);G.log("Crate: battery cells (+40 charge).",COL.bone);}
+      else{p.inv[k]=(p.inv[k]||0)+(k==="ammo"?5:1);G.log("Crate: "+(k==="ammo"?"5 rounds":"1 "+k)+".",COL.bone);}
+      Sfx.blip();break;}
+    case"exit":exitHouse();break;
+    case"sealed":G.log("Sealed. The house wants the rite, not the handle.",COL.red);Sfx.growl();break;
+    case"hidden":it.hd.opened=true;G.log("Stone grinds aside — a hidden passage opens.",faction().color);Sfx.seal();break;
+    case"trigger":it.t.used=true;setCurse(inst,CurseState.OMEN);break;
+    case"clue":{
+      const cl=it.cl;cl.taken=true;
+      if(cl.fake){
+        if(faction().seesFake){G.log("Forged clue identified and discarded. (Assyrian training)",faction().color);Sfx.blip();}
+        else{p.res=clamp(p.res-10,0,p.resMax);G.log(inst.def.fakeClue+"  (−10 resolve)",COL.red);Sfx.mimic();}
+      }else{
+        inst.cluesFound++;G.stats.clues++;
+        let bonus="";
+        if(faction().key===inst.def.affinity){p.res=clamp(p.res+6,0,p.resMax);bonus="  (+6 resolve — your order knows this curse)";}
+        G.log("CLUE "+inst.cluesFound+"/3: "+inst.def.clueTexts[cl.idx]+bonus,COL.blue);Sfx.clue();
+        if(inst.cluesFound===3)G.log("You understand the curse. Reach the GREEN ward and press E.",COL.green);
+      }
+      break;}
+    case"salt":it.s.taken=true;p.inv.salt++;G.log("Salt cache taken. Old, dry, still holy.",COL.bone);Sfx.blip();break;
+    case"furn":{
+      it.f.looted=true;const roll=Math.random();
+      if(roll<0.28){p.inv.food++;G.log("Found canned food in the "+it.f.kind+".",COL.bone);}
+      else if(roll<0.52){p.inv.water++;G.log("Found clean water in the "+it.f.kind+".",COL.bone);}
+      else if(roll<0.72){p.inv.ammo+=3;G.log("Found 3 rounds in the "+it.f.kind+".",COL.bone);}
+      else if(roll<0.87){p.battery=clamp(p.battery+25,0,p.batteryMax);G.log("Found battery cells in the "+it.f.kind+".",COL.bone);}
+      else G.log("Nothing but dust and a family photograph.","#888");
+      Sfx.blip();break;}
+    case"ritual":beginRitual();break;
+    case"noritual":G.log(it.label,COL.green);break;
+    case"resolvedHouse":G.log(it.label+".",COL.green);break;
+  }
+}
+
+function enterHouse(id){
+  if(!G.houseInst[id])G.houseInst[id]=makeHouseInstance(id);
+  G.houseIdx=id;G.house=G.houseInst[id];
+  G.state=GameState.HOUSE;
+  const inst=G.house,p=G.player;
+  p.x=inst.exit.c+0.5;p.y=inst.exit.r-0.7;p.dir=-Math.PI/2;
+  G.mates.forEach((m,i)=>{m.x=p.x+(i?-0.7:0.7);m.y=p.y+0.5;m.distract=0;m.target=null;m.farT=0;});
+  G.log("You enter "+inst.def.name+" — "+inst.def.curseType+".",COL.purple);
+  if(faction().key===inst.def.affinity)G.log("Your order knows this curse. You feel prepared.",faction().color);
+}
+function exitHouse(){
+  const inst=G.house;
+  if(inst.curse===CurseState.OMEN){
+    setCurse(inst,CurseState.DORMANT);inst.trigger.used=false;
+    G.log("You flee before it fully wakes. The "+inst.def.trigger+" dims again.","#999");
+  }
+  G.state=GameState.WORLD;G.house=null;G.houseIdx=-1;
+  const d=VILLAGE.doors[String(inst.id+1)];
+  G.player.x=d.c+0.5;G.player.y=d.r+1.4;G.player.dir=Math.PI/2;
+  G.mates.forEach((m,i)=>{m.x=G.player.x+(i?-0.8:0.8);m.y=G.player.y+0.6;m.target=null;});
+  if(G.resolvedCount>=3)G.state=GameState.WIN;
+}
+
+function setCurse(inst,st){
+  inst.curse=st;inst.curseT=0;
+  switch(st){
+    case CurseState.OMEN:
+      G.log(inst.def.omen,COL.purple);Sfx.curse();G.shake=6;break;
+    case CurseState.SEAL:
+      inst.exit.sealed=true;
+      G.log("THE DOORS SEAL SHUT. The house is the arena now.",COL.red);Sfx.seal();G.shake=9;break;
+    case CurseState.HUNT:
+      if(!inst.monster)inst.monster={x:inst.mSpawn.x,y:inst.mSpawn.y,r:0.3,stagger:0,hitCd:0,wob:0};
+      if(!inst.scared){inst.scared=true;G.jump=1;G.jumpFace=inst.id;Sfx.scream();}
+      G.log(inst.def.monster+" begins to hunt. Bullets stagger it — clues end it.",COL.red);Sfx.growl();break;
+    case CurseState.DISTORTION:
+      G.log("DISTORTION — the rooms lie, the map lies, your friends may lie.","#c040ff");Sfx.curse();break;
+    case CurseState.JUDGMENT:
+      G.log("JUDGMENT — hold the ward. Do not move. Do not shoot.","#ffd040");Sfx.ritual();break;
+    case CurseState.RESOLVED:{
+      inst.resolved=true;inst.exit.sealed=false;inst.monster=null;inst.mimic=null;
+      G.resolvedCount++;
+      const p=G.player;
+      p.inv.food+=2;p.inv.water+=2;p.inv.ammo+=6;p.inv.salt+=1;
+      p.res=clamp(p.res+40,0,p.resMax);
+      G.greenFlash=1;
+      G.log(inst.def.resolvedText,COL.green);
+      G.log("House cache unlocked: +2 food, +2 water, +6 ammo, +1 salt.",COL.green);
+      G.log("Houses resolved: "+G.resolvedCount+"/3.",COL.green);Sfx.ritual();break;}
+  }
+}
+function beginRitual(){
+  const inst=G.house;
+  if(inst.curse===CurseState.JUDGMENT)return;
+  inst.preState=inst.curse;
+  setCurse(inst,CurseState.JUDGMENT);
+  G.channeling=true;G.channel=0;
+}
+
+/* ------------------------------ update ----------------------------- */
+let last=performance.now();
+function update(dt){
+  G.time+=dt;
+  G.shake=Math.max(0,G.shake-dt*22);
+  G.dmgFlash=Math.max(0,G.dmgFlash-dt*1.5);
+  G.greenFlash=Math.max(0,G.greenFlash-dt*0.7);
+  G.jump=Math.max(0,G.jump-dt*1.7);
+  // candle-like flicker
+  if(Math.random()<0.06)G.flicker=0.9+Math.random()*0.16;
+  if(G.state===GameState.TITLE||G.state===GameState.GAME_OVER||G.state===GameState.WIN)return;
+
+  const p=G.player,inHouse=G.state===GameState.HOUSE,inst=G.house;
+  p.shotCd=Math.max(0,p.shotCd-dt);p.hitCd=Math.max(0,p.hitCd-dt);
+  p.recoil=Math.max(0,p.recoil-dt*5);
+
+  /* movement: WASD strafe + arrows, arrows LR turn */
+  if(keys["arrowleft"])p.dir-=2.4*dt;
+  if(keys["arrowright"])p.dir+=2.4*dt;
+  let fw=(keys["w"]||keys["arrowup"]?1:0)-(keys["s"]||keys["arrowdown"]?1:0);
+  let st=(keys["d"]?1:0)-(keys["a"]?1:0);
+  const sprinting=keys["shift"]&&p.sta>1&&(fw||st);
+  let spd=sprinting?4.5:2.9;
+  if(G.channeling)spd=0;
+  if(inHouse&&inst.curse>=CurseState.HUNT&&inst.dangerSet.has(Math.floor(p.x)+","+Math.floor(p.y))){
+    spd*=0.8;p.res=clamp(p.res-2*dt,0,p.resMax);
+  }
+  if(fw||st){
+    const n=Math.hypot(fw,st);fw/=n;st/=n;
+    const dx=(Math.cos(p.dir)*fw+Math.cos(p.dir+Math.PI/2)*st)*spd*dt;
+    const dy=(Math.sin(p.dir)*fw+Math.sin(p.dir+Math.PI/2)*st)*spd*dt;
+    moveEnt(p,dx,dy);
+    p.bob+=dt*(sprinting?11:7.5);
+    if(G.channeling){G.channeling=false;G.channel=0;G.log("You step out of the rite. The ward dims.",COL.red);}
+  }
+  p.sta=clamp(p.sta+(sprinting?-25:15)*dt,0,100);
+
+  /* needs */
+  p.hunger=clamp(p.hunger+0.22*dt,0,100);
+  p.thirst=clamp(p.thirst+0.28*dt,0,100);
+  if(p.hunger>=85&&p.inv.food>0){p.inv.food--;p.hunger-=55;G.log("You wolf down a ration.",COL.bone);}
+  if(p.thirst>=85&&p.inv.water>0){p.inv.water--;p.thirst-=55;G.log("You drink deep.",COL.bone);}
+  if(p.hunger>=100)p.hp-=1.2*dt;
+  if(p.thirst>=100)p.hp-=1.6*dt;
+  if(G.flashlight){p.battery=clamp(p.battery-1.2*dt,0,p.batteryMax);
+    if(p.battery<=0){G.flashlight=false;G.log("The flashlight dies.",COL.red);}}
+
+  /* teammates follow / wander */
+  for(let i=0;i<G.mates.length;i++){
+    const m=G.mates[i];
+    m.distract=Math.max(0,m.distract-dt);
+    if(inHouse&&inst.curse>=CurseState.OMEN&&inst.curse<CurseState.RESOLVED&&m.distract<=0&&Math.random()<0.0022){
+      const f=inst.furniture[Math.floor(Math.random()*inst.furniture.length)];
+      if(f){m.target={x:f.x,y:f.y};m.distract=4+Math.random()*4;}
+    }
+    let tx,ty;
+    if(m.target&&m.distract>0){tx=m.target.x;ty=m.target.y;}
+    else{m.target=null;const a=p.dir+Math.PI+(i?0.6:-0.6);tx=p.x+Math.cos(a)*1.1;ty=p.y+Math.sin(a)*1.1;}
+    const d=Math.hypot(tx-m.x,ty-m.y);
+    if(d>0.35){const s=Math.min(3.3*dt,d);moveEnt(m,(tx-m.x)/d*s,(ty-m.y)/d*s);}
+    if(inHouse&&dist2(m.x,m.y,p.x,p.y)>5)m.farT+=dt;else m.farT=Math.max(0,m.farT-dt*2);
+  }
+
+  if(inHouse)updateHouse(dt);
+
+  /* ambience: resolve drain, heartbeat, creaks */
+  let threat=0;
+  if(inHouse&&inst.curse>=CurseState.SEAL&&inst.curse<CurseState.RESOLVED){
+    p.res-=(G.flashlight?0.22:0.45)*dt;
+    for(const m of G.mates)if(dist2(m.x,m.y,p.x,p.y)<3.2)p.res+=0.18*dt;
+    if(inst.ward&&dist2(p.x,p.y,inst.ward.x,inst.ward.y)<inst.ward.r)p.res+=3.5*dt;
+    if(inst.monster){const md=dist2(inst.monster.x,inst.monster.y,p.x,p.y);
+      if(md<4)p.res-=1.2*dt;
+      threat=clamp(1-md/8,0,1);}
+    p.res=clamp(p.res,0,p.resMax);
+  }
+  threat=Math.max(threat,1-p.res/p.resMax*1.2);
+  G.hbT-=dt;
+  if(G.hbT<=0){G.hbT=lerp(1.15,0.38,clamp(threat,0,1));if(inHouse||threat>0.2)Sfx.thump(threat>0.55);}
+  if(inHouse){G.creakT-=dt;if(G.creakT<=0){G.creakT=8+Math.random()*8;Sfx.creak();}}
+
+  if(p.hp<=0){G.state=GameState.GAME_OVER;G.overCause="Your body gave out. The zone keeps what it kills.";}
+  else if(p.res<=0){G.state=GameState.GAME_OVER;G.overCause="Your mind surrendered to the house. You are still in there, setting the table.";}
+}
+
+function updateHouse(dt){
+  const inst=G.house,p=G.player;
+  inst.curseT+=dt;
+
+  /* hidden door sensing */
+  G.hiddenSeen=false;
+  for(const hd of inst.hidden){
+    if(hd.opened)continue;
+    if(dist2(p.x,p.y,hd.c+0.5,hd.r+0.5)<faction().hiddenRadius){hd.seen=true;G.hiddenSeen=true;}
+  }
+
+  /* curse machine */
+  switch(inst.curse){
+    case CurseState.OMEN:if(inst.curseT>5)setCurse(inst,CurseState.SEAL);break;
+    case CurseState.SEAL:if(inst.curseT>6)setCurse(inst,CurseState.HUNT);break;
+    case CurseState.HUNT:if(inst.curseT>35)setCurse(inst,CurseState.DISTORTION);break;
+    case CurseState.JUDGMENT:{
+      if(G.channeling){
+        let rate=1;if(faction().key===inst.def.affinity)rate*=1.2;
+        G.channel+=dt*rate;
+        const need=faction().ritualTime||5;
+        if(G.channel>=need){G.channeling=false;G.channel=0;p.inv.salt--;setCurse(inst,CurseState.RESOLVED);}
+      }else setCurse(inst,inst.preState===CurseState.DISTORTION?CurseState.DISTORTION:CurseState.HUNT);
+      break;}
+  }
+
+  /* whispers */
+  if(inst.curse>=CurseState.OMEN&&inst.curse<CurseState.RESOLVED){
+    inst.whisperT-=dt;
+    if(inst.whisperT<=0){
+      inst.whisperT=5+Math.random()*5;
+      const t=inst.def.whispers[Math.floor(Math.random()*inst.def.whispers.length)];
+      G.whispers.push({text:t,x:140+Math.random()*(W-280),y:130+Math.random()*(H-320),t:0});
+      Sfx.whisper();
+    }
+  }
+  for(let i=G.whispers.length-1;i>=0;i--){G.whispers[i].t+=dt;if(G.whispers[i].t>4)G.whispers.splice(i,1);}
+
+  /* monster AI */
+  const M=inst.monster;
+  if(M&&inst.curse>=CurseState.HUNT&&inst.curse<CurseState.RESOLVED){
+    M.wob+=dt*6;M.hitCd=Math.max(0,M.hitCd-dt);
+    if(M.stagger>0)M.stagger-=dt;
+    else{
+      let spd=1.7;
+      if(inst.curse===CurseState.DISTORTION)spd=2.1;
+      if(inst.curse===CurseState.JUDGMENT)spd=2.6;
+      if(G.night)spd*=1.15;
+      if(faction().monsterSlow)spd*=faction().monsterSlow;
+      // being caught in the flashlight beam slows it
+      if(G.flashlight&&Math.abs(normAng(Math.atan2(M.y-p.y,M.x-p.x)-p.dir))<0.5
+         &&dist2(M.x,M.y,p.x,p.y)<7&&!losBlocked(p.x,p.y,M.x,M.y))spd*=0.72;
+      for(const m of G.mates)if(dist2(m.x,m.y,M.x,M.y)<2)spd*=0.62;
+      const d=dist2(M.x,M.y,p.x,p.y);
+      if(d>0.05){
+        const vx=(p.x-M.x)/d,vy=(p.y-M.y)/d;
+        const jx=Math.cos(M.wob*1.7)*0.25,jy=Math.sin(M.wob*1.3)*0.25;
+        moveEnt(M,(vx+jx)*spd*dt,(vy+jy)*spd*dt);
+      }
+      if(d<M.r+p.r+0.15&&M.hitCd<=0&&p.hitCd<=0){
+        M.hitCd=1;p.hitCd=0.9;p.hp=clamp(p.hp-14,0,p.hpMax);
+        G.dmgFlash=1;G.shake=10;Sfx.hurt();
+        const a=Math.atan2(p.y-M.y,p.x-M.x);
+        moveEnt(p,Math.cos(a)*0.7,Math.sin(a)*0.7);
+        if(G.channeling){G.channeling=false;G.channel=0;G.log("The blow breaks your rite!",COL.red);}
+        G.log(inst.def.monster+" tears at you. (−14 health)",COL.red);
+      }
+    }
+  }
+
+  /* mimic: isolation breeds copies — and it spawns BEHIND you */
+  G.mimicCd=Math.max(0,G.mimicCd-dt);
+  if(!inst.mimic&&G.mimicCd<=0&&inst.curse>=CurseState.SEAL&&inst.curse<CurseState.RESOLVED){
+    const lost=G.mates.find(m=>m.farT>4);
+    if(lost){
+      let mx=p.x-Math.cos(p.dir)*3,my=p.y-Math.sin(p.dir)*3;
+      if(entColl(mx,my,0.25)){mx=lost.x;my=lost.y;}
+      inst.mimic={x:mx,y:my,r:0.24,name:lost.name,reveal:0,dissolve:0};
+      lost.farT=0;lost.target=null;
+      G.stats.mimics++;Sfx.mimic();
+    }
+  }
+  const mk=inst.mimic;
+  if(mk){
+    if(mk.dissolve>0){
+      mk.dissolve-=dt;
+      if(mk.dissolve<=0){inst.mimic=null;G.mimicCd=18;p.res=clamp(p.res+5,0,p.resMax);
+        G.log("The false "+mk.name+" dissolves in the light. (+5 resolve)",COL.green);}
+    }else{
+      const d=dist2(mk.x,mk.y,p.x,p.y);
+      if(d>0.7){const s=1.15*dt;moveEnt(mk,(p.x-mk.x)/d*s,(p.y-mk.y)/d*s);}
+      const inBeam=G.flashlight&&Math.abs(normAng(Math.atan2(mk.y-p.y,mk.x-p.x)-p.dir))<0.32
+        &&d<6&&!losBlocked(p.x,p.y,mk.x,mk.y);
+      if(inBeam){mk.reveal+=dt;}else mk.reveal=Math.max(0,mk.reveal-dt*0.5);
+      if(mk.reveal>1&&mk.dissolve<=0){mk.dissolve=0.8;Sfx.mimic();}
+      if(d<mk.r+p.r+0.1){
+        inst.mimic=null;G.mimicCd=18;
+        p.res=clamp(p.res-20,0,p.resMax);G.dmgFlash=0.8;G.shake=8;
+        G.jump=0.7;G.jumpFace=-1;Sfx.scream();
+        G.log("It was never "+mk.name+". Cold hands, wrong smile. (−20 resolve)",COL.red);
+      }
+    }
+  }
+}
+
+/* ==================== 3D RENDERING ==================== */
+const zbuf=new Float32Array(NUM_RAYS);
+function ambientFog(){
+  if(G.state===GameState.WORLD)return G.night?{fog:8,amb:0.34}:{fog:13,amb:0.72};
+  const cs=G.house?G.house.curse:0;
+  if(cs>=CurseState.DISTORTION)return{fog:4.6,amb:0.38};
+  if(cs>=CurseState.SEAL)return{fog:6,amb:0.46};
+  return G.night?{fog:6.5,amb:0.5}:{fog:8,amb:0.62};
+}
+function renderScene(){
+  const p=G.player,{fog,amb}=ambientFog();
+  const outdoor=G.state===GameState.WORLD;
+  const bobY=Math.sin(p.bob)*5*(keys["shift"]?1.4:1);
+  const horizon=HALF+bobY+(G.shake?(Math.random()-0.5)*G.shake:0);
+  const distortion=G.house&&G.house.curse===CurseState.DISTORTION;
+
+  /* sky / ceiling */
+  if(outdoor){
+    const sky=ctx.createLinearGradient(0,0,0,horizon);
+    if(G.night){sky.addColorStop(0,"#020208");sky.addColorStop(1,"#0a0c1a");}
+    else{sky.addColorStop(0,"#3a3f46");sky.addColorStop(1,"#565c60");}
+    ctx.fillStyle=sky;ctx.fillRect(0,0,W,horizon);
+    if(G.night){
+      for(let i=0;i<70;i++){const h=hash2(i,3);
+        ctx.fillStyle="rgba(255,255,255,"+(0.15+(h%50)/220)+")";
+        ctx.fillRect(((h%W)+G.time*1.5)%W,(h>>5)%Math.max(40,horizon-60),1.4,1.4);}
+      ctx.fillStyle="#c8c4b0";ctx.beginPath();
+      ctx.arc(W*0.78,horizon*0.34,26,0,7);ctx.fill();
+      ctx.fillStyle=G.night?"#0a0c16":"#3a3f46";
+      ctx.beginPath();ctx.arc(W*0.78+10,horizon*0.34-6,22,0,7);ctx.fill();
+    }else{
+      ctx.fillStyle="rgba(30,32,36,.5)";
+      for(let i=0;i<4;i++){const y=20+i*30+Math.sin(G.time*0.1+i)*6;
+        ctx.beginPath();ctx.ellipse((i*280+G.time*6)%(W+300)-150,y,170,17,0,0,7);ctx.fill();}
+    }
+  }else{
+    const ceil=ctx.createLinearGradient(0,0,0,horizon);
+    ceil.addColorStop(0,"#0b0910");ceil.addColorStop(1,"#040308");
+    ctx.fillStyle=ceil;ctx.fillRect(0,0,W,horizon);
+  }
+  /* floor */
+  const fl=ctx.createLinearGradient(0,horizon,0,H);
+  if(outdoor){fl.addColorStop(0,"#05070a");fl.addColorStop(1,G.night?"#0c1410":"#17221a");}
+  else{fl.addColorStop(0,"#050408");fl.addColorStop(1,"#191420");}
+  ctx.fillStyle=fl;ctx.fillRect(0,horizon,W,H-horizon);
+
+  /* walls */
+  const tanH=Math.tan(FOV/2);
+  for(let i=0;i<NUM_RAYS;i++){
+    const cam=(i/NUM_RAYS)*2-1;
+    const ang=p.dir+Math.atan(cam*tanH);
+    const hit=castRay(p.x,p.y,ang);
+    const depth=hit.dist*Math.cos(ang-p.dir);
+    zbuf[i]=depth;
+    let lineH=H/depth;
+    let wob=0;
+    if(distortion)wob=Math.sin(G.time*4+i*0.055)*Math.min(14,lineH*0.06);
+    const x=i*COLW;
+    const y0=horizon-lineH/2+wob;
+    const tex=wallTexFor(hit.ch,hit.mc,hit.mr);
+    const tx=Math.floor(hit.texX*64);
+    ctx.drawImage(tex,tx,0,1,64,x,y0,COLW,lineH);
+    /* shade: distance fog + side + ambient + flicker */
+    let dark=1-clamp(depth/fog,0,1);
+    dark*=amb*G.flicker*(hit.side?0.78:1);
+    /* flashlight brightens the middle of the view */
+    if(G.flashlight&&G.player.battery>0){
+      const cone=1-clamp(Math.abs(cam)/0.62,0,1);
+      dark=clamp(dark+cone*0.55*(1-clamp(depth/9,0,1)),0,1);
+    }
+    ctx.fillStyle="rgba(0,0,0,"+clamp(1-dark,0,1)+")";
+    ctx.fillRect(x,y0,COLW,lineH);
+  }
+
+  /* sprites */
+  const spr=[];
+  const push=(x,y,cnv,h,yOff,label,labelCol)=>{const d=dist2(p.x,p.y,x,y);
+    if(d>0.3)spr.push({x,y,cnv,h,yOff:yOff||0,d,label,labelCol});};
+  if(outdoor){
+    VILLAGE.trees.forEach((t,i)=>push(t.x,t.y,SPR.trees[i],2.6,0));
+    for(const c of VILLAGE.crates)if(!c.taken)push(c.x,c.y,SPR.crate,0.55,0);
+  }else{
+    const inst=G.house,pulse=0.5+0.5*Math.sin(G.time*3);
+    for(const f of inst.furniture)push(f.x,f.y,f.looted?SPR.furnOpen:SPR.furn,0.85,0);
+    for(const s of inst.salts)if(!s.taken)push(s.x,s.y,SPR.salt,0.4,0);
+    if(inst.ward)push(inst.ward.x,inst.ward.y,SPR.ward,0.9,0);
+    if(inst.curse>=CurseState.OMEN&&inst.curse<CurseState.RESOLVED)
+      for(const cl of inst.clues)if(!cl.taken)
+        push(cl.x,cl.y,SPR.clue,0.42,0.5+Math.sin(G.time*2.5+cl.x)*0.08,
+          cl.fake&&faction().seesFake?"FALSE":null,COL.red);
+    if(inst.trigger&&!inst.trigger.used)
+      push(inst.trigger.x,inst.trigger.y,SPR.triggers[inst.id],0.55,0.25+pulse*0.05);
+    if(inst.curse>=CurseState.HUNT&&inst.curse<CurseState.RESOLVED)
+      for(const dt_ of inst.danger)push(dt_.x,dt_.y,SPR.rune,0.3,0.12+0.06*Math.sin(G.time*5+dt_.y));
+    if(inst.monster){
+      const M=inst.monster,fr=Math.floor(G.time*2.4)%2;
+      push(M.x,M.y,SPR.monsters[inst.id][fr],SPR.monsterH[inst.id]*(1+Math.sin(M.wob)*0.03),
+        inst.id===2?0.22+Math.sin(G.time*1.8)*0.08:0,
+        M.stagger>0?"STAGGERED":null,"#ffb060");
+    }
+    if(inst.mimic){
+      const mk=inst.mimic,exposed=mk.reveal>0.15||mk.dissolve>0;
+      push(mk.x,mk.y,exposed?SPR.mimicTell:SPR.mate,0.78,0,
+        exposed?"!! MIMIC !!":mk.name,exposed?COL.red:"#c8d4e8");
+    }
+  }
+  for(const m of G.mates)push(m.x,m.y,SPR.mate,0.78,0,m.name,"#c8d4e8");
+
+  spr.sort((a,b)=>b.d-a.d);
+  for(const s of spr){
+    const a=normAng(Math.atan2(s.y-p.y,s.x-p.x)-p.dir);
+    if(Math.abs(a)>FOV/2+0.5)continue;
+    const depth=s.d*Math.cos(a);
+    if(depth<0.15)continue;
+    const lineH=H/depth;
+    const size=lineH*s.h;
+    const sw=size*(s.cnv.width/s.cnv.height);
+    const sx=W/2+Math.tan(a)/tanH*(W/2)-sw/2;
+    const syBottom=horizon+lineH/2-lineH*s.yOff;
+    const sy=syBottom-size;
+    /* distance shading via alpha */
+    let vis=1-clamp(depth/fog,0,1);
+    vis=clamp(vis*1.35*(amb+0.45),0,1);
+    if(G.flashlight&&p.battery>0){
+      const cone=1-clamp(Math.abs(a)/0.55,0,1);
+      vis=clamp(vis+cone*0.5*(1-clamp(depth/9,0,1)),0,1);
+    }
+    vis=Math.max(vis,0.7*(1-clamp(depth/3,0,1))); // never lose things at arm's length
+    if(vis<=0.02)continue;
+    /* per-2px-column occlusion against zbuffer */
+    const i0=Math.max(0,Math.floor(sx/COLW)),i1=Math.min(NUM_RAYS-1,Math.floor((sx+sw)/COLW));
+    ctx.globalAlpha=vis;
+    let drawnAny=false;
+    for(let i=i0;i<=i1;i++){
+      if(zbuf[i]<=depth)continue;
+      const cx=i*COLW;
+      const u=(cx-sx)/sw*s.cnv.width;
+      ctx.drawImage(s.cnv,u,0,Math.max(1,s.cnv.width/sw*COLW),s.cnv.height,cx,sy,COLW,size);
+      drawnAny=true;
+    }
+    ctx.globalAlpha=1;
+    if(drawnAny&&s.label&&depth<7){
+      ctx.font="bold "+clamp(16/depth*4,9,15)+"px monospace";ctx.textAlign="center";
+      ctx.fillStyle=s.labelCol||"#fff";
+      ctx.globalAlpha=vis;
+      ctx.fillText(s.label,sx+sw/2,sy-4);
+      ctx.globalAlpha=1;
+    }
+  }
+}
+
+/* ---------- viewmodel: revolver + torch ---------- */
+function renderHands(){
+  const p=G.player;
+  const bobX=Math.sin(p.bob*0.5)*7,bobY=Math.abs(Math.cos(p.bob*0.5))*5;
+  /* torch throw: a warm pool of light that carries the whole view */
+  if(G.flashlight&&p.battery>0){
+    const fl=0.92+Math.random()*0.1;
+    ctx.save();ctx.globalCompositeOperation="lighter";
+    let g=ctx.createRadialGradient(W/2,HALF+40,20,W/2,HALF+40,340*fl);
+    g.addColorStop(0,"rgba(255,214,150,.17)");g.addColorStop(0.55,"rgba(200,160,110,.07)");g.addColorStop(1,"rgba(0,0,0,0)");
+    ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+    g=ctx.createRadialGradient(W/2,H-40,10,W/2,H-40,300);
+    g.addColorStop(0,"rgba(255,210,140,.10)");g.addColorStop(1,"rgba(0,0,0,0)");
+    ctx.fillStyle=g;ctx.fillRect(0,HALF,W,HALF);
+    ctx.restore();
+  }
+  /* torch, left */
+  if(G.flashlight&&p.battery>0){
+    const fx=150+bobX*0.6,fy=H-90+bobY;
+    const fl=0.8+Math.random()*0.4;
+    const g=ctx.createRadialGradient(fx+18,fy-38,2,fx+18,fy-38,36*fl);
+    g.addColorStop(0,"rgba(255,220,140,.85)");g.addColorStop(1,"rgba(0,0,0,0)");
+    ctx.fillStyle=g;ctx.beginPath();ctx.arc(fx+18,fy-38,36*fl,0,7);ctx.fill();
+    ctx.fillStyle="#1a1410";ctx.save();ctx.translate(fx,fy);ctx.rotate(-0.5);
+    ctx.fillRect(0,0,14,64);ctx.restore();
+    ctx.fillStyle="#3a3026";ctx.beginPath();ctx.ellipse(fx+16,fy-30,13,9,-0.5,0,7);ctx.fill();
+    ctx.fillStyle="#2a2622";ctx.beginPath();ctx.ellipse(fx-4,fy+42,26,18,0.3,0,7);ctx.fill(); // hand
+  }
+  /* revolver, right */
+  const kick=p.recoil*22;
+  const gx=W-250+bobX,gy=H-118+bobY+kick;
+  ctx.save();ctx.translate(gx,gy);ctx.rotate(-0.08-p.recoil*0.12);
+  ctx.fillStyle="#2e2e3c";ctx.fillRect(48,4,96,20);            // barrel
+  ctx.fillStyle="rgba(200,200,230,.22)";ctx.fillRect(48,4,96,4); // barrel sheen
+  ctx.fillStyle="#1c1c26";ctx.fillRect(48,18,96,6);
+  ctx.fillStyle="#3c3c4c";ctx.fillRect(138,-2,10,12);          // sight
+  ctx.fillStyle="#3a3a4a";ctx.beginPath();ctx.arc(52,24,22,0,7);ctx.fill(); // cylinder
+  ctx.strokeStyle="rgba(220,220,255,.25)";ctx.lineWidth=2;
+  ctx.beginPath();ctx.arc(52,24,21,-2.4,-0.4);ctx.stroke();     // cylinder rim light
+  ctx.fillStyle="#14141c";
+  for(let i=0;i<3;i++)ctx.beginPath(),ctx.arc(44+i*10,24,3.4,0,7),ctx.fill();
+  ctx.fillStyle="#3a2a1a";ctx.beginPath();                      // grip
+  ctx.moveTo(30,34);ctx.quadraticCurveTo(8,64,20,108);ctx.lineTo(52,102);ctx.quadraticCurveTo(46,60,56,42);ctx.closePath();ctx.fill();
+  ctx.strokeStyle="rgba(255,220,170,.16)";ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(31,38);ctx.quadraticCurveTo(12,64,22,104);ctx.stroke();
+  ctx.fillStyle="#4a4036";ctx.beginPath();ctx.ellipse(38,92,30,24,0.2,0,7);ctx.fill(); // hand
+  ctx.fillStyle="rgba(255,225,190,.1)";ctx.beginPath();ctx.ellipse(32,84,16,10,0.3,0,7);ctx.fill();
+  ctx.restore();
+  if(p.recoil>0.55){ // muzzle flash
+    const mfx=gx+150,mfy=gy+8;
+    const g=ctx.createRadialGradient(mfx,mfy,2,mfx,mfy,46);
+    g.addColorStop(0,"rgba(255,240,180,.95)");g.addColorStop(0.4,"rgba(255,160,40,.6)");g.addColorStop(1,"rgba(0,0,0,0)");
+    ctx.fillStyle=g;ctx.beginPath();ctx.arc(mfx,mfy,46,0,7);ctx.fill();
+  }
+}
+
+/* ---------- post fx ---------- */
+function renderPost(){
+  const p=G.player;
+  /* vignette */
+  const v=ctx.createRadialGradient(W/2,H/2,H*0.28,W/2,H/2,H*0.72);
+  v.addColorStop(0,"rgba(0,0,0,0)");v.addColorStop(1,"rgba(0,0,0,.62)");
+  ctx.fillStyle=v;ctx.fillRect(0,0,W,H);
+  /* film grain */
+  ctx.fillStyle="rgba(255,255,255,.03)";
+  for(let i=0;i<130;i++)ctx.fillRect(Math.random()*W,Math.random()*H,1.4,1.4);
+  /* low health blood edges */
+  if(p.hp<38){
+    const a=(0.25+0.15*Math.sin(G.time*4))*(1-p.hp/38);
+    const g=ctx.createRadialGradient(W/2,H/2,H*0.2,W/2,H/2,H*0.66);
+    g.addColorStop(0,"rgba(0,0,0,0)");g.addColorStop(1,"rgba(160,10,10,"+a+")");
+    ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+  }
+  /* low resolve — purple madness edges + faint hands */
+  if(p.res<p.resMax*0.35){
+    const a=(0.2+0.1*Math.sin(G.time*2.6))*(1-p.res/(p.resMax*0.35));
+    const g=ctx.createRadialGradient(W/2,H/2,H*0.24,W/2,H/2,H*0.7);
+    g.addColorStop(0,"rgba(0,0,0,0)");g.addColorStop(1,"rgba(120,40,200,"+a+")");
+    ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+  }
+  if(G.dmgFlash>0){ctx.fillStyle="rgba(255,25,25,"+G.dmgFlash*0.26+")";ctx.fillRect(0,0,W,H);}
+  if(G.greenFlash>0){ctx.fillStyle="rgba(60,220,130,"+G.greenFlash*0.26+")";ctx.fillRect(0,0,W,H);}
+  /* distortion hue drift */
+  if(G.house&&G.house.curse===CurseState.DISTORTION){
+    ctx.fillStyle="rgba(140,40,220,"+(0.05+0.05*Math.sin(G.time*7))+")";ctx.fillRect(0,0,W,H);
+    if(Math.sin(G.time*3.3)>0.965){ctx.fillStyle="rgba(255,255,255,.06)";ctx.fillRect(0,Math.random()*H,W,26);}
+  }
+  /* jumpscare face */
+  if(G.jump>0&&G.jumpFace>=0){
+    const t=1-G.jump; // 0..1
+    const sc=lerp(1.4,4.2,t),al=G.jump<0.25?G.jump*4:1;
+    ctx.save();ctx.globalAlpha=al*0.92;
+    ctx.fillStyle="rgba(0,0,0,.8)";ctx.fillRect(0,0,W,H);
+    const f=SPR.faces[G.jumpFace],s=200*sc;
+    ctx.translate(W/2+(Math.random()-0.5)*22,H/2+(Math.random()-0.5)*22);
+    ctx.drawImage(f,-s/2,-s/2,s,s);
+    ctx.restore();
+  } else if(G.jump>0){ // mimic touch: dark red slam
+    ctx.fillStyle="rgba(120,0,0,"+G.jump*0.5+")";ctx.fillRect(0,0,W,H);
+  }
+  /* channel ring */
+  if(G.channeling){
+    const need=faction().ritualTime||5,frac=clamp(G.channel/need,0,1);
+    ctx.strokeStyle="rgba(20,60,40,.9)";ctx.lineWidth=10;
+    ctx.beginPath();ctx.arc(W/2,H/2,64,0,7);ctx.stroke();
+    ctx.strokeStyle=COL.green;ctx.lineWidth=7;
+    ctx.beginPath();ctx.arc(W/2,H/2,64,-Math.PI/2,-Math.PI/2+frac*Math.PI*2);ctx.stroke();
+    ctx.fillStyle=COL.green;ctx.font="bold 15px monospace";ctx.textAlign="center";
+    ctx.fillText("JUDGMENT "+Math.round(frac*100)+"%",W/2,H/2-80);
+    ctx.font="11px monospace";ctx.fillStyle="rgba(200,255,220,.8)";
+    ctx.fillText("do not move · do not shoot",W/2,H/2+92);
+  }
+  /* whispers */
+  for(const wsp of G.whispers){
+    const a=wsp.t<0.5?wsp.t*2:(wsp.t>3?(4-wsp.t):1);
+    ctx.fillStyle="rgba(190,140,240,"+a*0.6+")";
+    ctx.font="italic 15px serif";ctx.textAlign="center";
+    ctx.fillText(wsp.text,wsp.x+Math.sin(G.time*9+wsp.y)*2,wsp.y-wsp.t*9);
+  }
+}
+
+/* ---------- HUD ---------- */
+function segBar(x,y,w,label,val,max,col){
+  ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(x,y,w,11);
+  const segs=10,sw=(w-2)/segs;
+  const lit=Math.round(clamp(val/max,0,1)*segs);
+  for(let i=0;i<segs;i++){
+    ctx.fillStyle=i<lit?col:"rgba(255,255,255,.07)";
+    ctx.fillRect(x+1+i*sw,y+1.5,sw-1.5,8);
+  }
+  ctx.strokeStyle="rgba(255,255,255,.22)";ctx.lineWidth=1;ctx.strokeRect(x+0.5,y+0.5,w,11);
+  ctx.fillStyle="rgba(235,230,220,.9)";ctx.font="9px monospace";ctx.textAlign="left";
+  ctx.fillText(label,x+w+7,y+9);
+}
+function renderHUD(){
+  const p=G.player;
+  /* bottom plate */
+  const plate=ctx.createLinearGradient(0,H-84,0,H);
+  plate.addColorStop(0,"rgba(6,5,10,0)");plate.addColorStop(0.4,"rgba(6,5,10,.82)");plate.addColorStop(1,"rgba(6,5,10,.95)");
+  ctx.fillStyle=plate;ctx.fillRect(0,H-84,W,84);
+  ctx.strokeStyle="rgba(150,110,220,.28)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(0,H-70);ctx.lineTo(W,H-70);ctx.stroke();
+
+  /* vitals (left of plate) */
+  segBar(16,H-62,110,"HEALTH",p.hp,p.hpMax,"#d83838");
+  segBar(16,H-47,110,"RESOLVE",p.res,p.resMax,"#a860f0");
+  segBar(16,H-32,110,"STAMINA",p.sta,100,"#d8b838");
+  segBar(200,H-62,88,"HUNGER",100-p.hunger,100,"#d88038");
+  segBar(200,H-47,88,"THIRST",100-p.thirst,100,"#38a8d8");
+  segBar(200,H-32,88,"BATTERY",p.battery,p.batteryMax,"#b8d8b0");
+
+  /* inventory (right of plate) */
+  ctx.textAlign="right";ctx.font="bold 13px monospace";
+  ctx.fillStyle="#e8d090";ctx.fillText("AMMO "+p.inv.ammo,W-18,H-50);
+  /* bullet pips */
+  for(let i=0;i<Math.min(p.inv.ammo,10);i++){
+    ctx.fillStyle="#c8a850";ctx.fillRect(W-24-i*8,H-46,4,9);
+  }
+  ctx.font="11px monospace";
+  ctx.fillStyle="#e0a060";ctx.fillText("FOOD ×"+p.inv.food,W-166,H-26);
+  ctx.fillStyle="#60c0e8";ctx.fillText("WATER ×"+p.inv.water,W-88,H-26);
+  ctx.fillStyle="#f0ead8";ctx.fillText("SALT ×"+p.inv.salt,W-18,H-26);
+  ctx.fillStyle=faction().color;ctx.textAlign="left";ctx.font="10px monospace";
+  ctx.fillText(faction().name.split("·")[0].trim().toUpperCase()+" · HOUSES "+G.resolvedCount+"/3"
+    +(G.state===GameState.HOUSE?" · CLUES "+G.house.cluesFound+"/3":""),16,H-12);
+  ctx.textAlign="right";
+  ctx.fillStyle=G.night?"#8890c8":"#c8c0a0";
+  ctx.fillText((G.night?"◑ NIGHT":"☁ DAY")+"   ⌁ "+(G.flashlight?"LIGHT ON":"LIGHT OFF"),W-18,H-12);
+
+  /* compass */
+  renderCompass();
+
+  /* house banner */
+  if(G.state===GameState.HOUSE&&G.house){
+    const inst=G.house,cs=inst.curse;
+    ctx.textAlign="center";
+    ctx.fillStyle="rgba(4,3,8,.72)";ctx.fillRect(W/2-210,10,420,40);
+    ctx.strokeStyle=CURSE_COL[cs];ctx.lineWidth=1.5;ctx.strokeRect(W/2-210,10,420,40);
+    /* rune corner ticks */
+    ctx.strokeStyle=CURSE_COL[cs];
+    [[-210,10],[210,10],[-210,50],[210,50]].forEach(([ox,oy])=>{
+      ctx.beginPath();ctx.moveTo(W/2+ox,oy+(oy>30?-8:8));ctx.lineTo(W/2+ox,oy);
+      ctx.lineTo(W/2+ox+(ox>0?-8:8),oy);ctx.stroke();});
+    ctx.fillStyle=COL.bone;ctx.font="bold 14px serif";
+    ctx.fillText(inst.def.name+" — "+inst.def.curseType,W/2,26);
+    ctx.fillStyle=CURSE_COL[cs];ctx.font="bold 11px monospace";
+    ctx.fillText("CURSE: "+CURSE_NAME[cs]+"  ·  "+objective(inst),W/2,42);
+  }
+
+  /* crosshair + prompt */
+  const it=(G.state===GameState.WORLD||G.state===GameState.HOUSE)?nearestInteractable():null;
+  ctx.strokeStyle=it?"#f0ead8":"rgba(255,255,255,.5)";ctx.lineWidth=1.6;
+  ctx.beginPath();ctx.moveTo(W/2-7,H/2);ctx.lineTo(W/2-2,H/2);ctx.moveTo(W/2+2,H/2);ctx.lineTo(W/2+7,H/2);
+  ctx.moveTo(W/2,H/2-7);ctx.lineTo(W/2,H/2-2);ctx.moveTo(W/2,H/2+2);ctx.lineTo(W/2,H/2+7);ctx.stroke();
+  if(it){
+    ctx.textAlign="center";ctx.font="bold 13px monospace";
+    const y=H/2+46;
+    const wdt=ctx.measureText("[E] "+it.label).width+26;
+    ctx.fillStyle="rgba(4,3,8,.72)";ctx.fillRect(W/2-wdt/2,y-15,wdt,22);
+    ctx.strokeStyle="rgba(255,255,255,.2)";ctx.strokeRect(W/2-wdt/2,y-15,wdt,22);
+    ctx.fillStyle=it.type==="trigger"?COL.purple:it.type==="ritual"?COL.green:it.type==="sealed"?COL.red:"#f0ead8";
+    ctx.fillText("[E] "+it.label,W/2,y);
+  }
+  if(!pointerLocked&&(G.state===GameState.WORLD||G.state===GameState.HOUSE)){
+    ctx.textAlign="center";ctx.fillStyle="rgba(255,255,255,"+(0.4+0.3*Math.sin(G.time*3))+")";
+    ctx.font="12px monospace";ctx.fillText("— click to capture mouse look —",W/2,H/2-40);
+  }
+
+  /* log */
+  ctx.textAlign="left";ctx.font="11px monospace";
+  let ly=H-96;
+  for(let i=G.logs.length-1;i>=0;i--){
+    const l=G.logs[i];
+    const a=clamp(1.3-(G.logs.length-1-i)*0.18,0.25,1);
+    ctx.fillStyle="rgba(0,0,0,.5)";ctx.fillRect(10,ly-11,ctx.measureText(l.text).width+10,14);
+    ctx.globalAlpha=a;ctx.fillStyle=l.color;ctx.fillText(l.text,14,ly);ctx.globalAlpha=1;
+    ly-=15;if(ly<H-96-15*5)break;
+  }
+  /* hint line (world only — the house banner owns the top in houses) */
+  if(G.state===GameState.WORLD){
+    ctx.textAlign="center";ctx.fillStyle="rgba(255,255,255,.25)";ctx.font="10px monospace";
+    ctx.fillText("WASD move · mouse look · click/space shoot · E interact · F light · N night · M map · J journal · R restart",W/2,16);
+  }
+}
+function renderCompass(){
+  const p=G.player,cw=300,x0=W/2-cw/2,y=62;
+  ctx.fillStyle="rgba(4,3,8,.55)";ctx.fillRect(x0,y-10,cw,18);
+  ctx.strokeStyle="rgba(255,255,255,.15)";ctx.strokeRect(x0,y-10,cw,18);
+  const marks=[["N",-Math.PI/2],["E",0],["S",Math.PI/2],["W",Math.PI]];
+  const put=(txt,ang,col,big)=>{
+    const rel=normAng(ang-p.dir);
+    if(Math.abs(rel)>1.15)return;
+    const px=W/2+rel/1.15*(cw/2-12);
+    ctx.fillStyle=col;ctx.font=(big?"bold 12px":"10px")+" monospace";ctx.textAlign="center";
+    ctx.fillText(txt,px,y+4);
+  };
+  for(const [t,a] of marks)put(t,a,"rgba(220,215,200,.75)",false);
+  if(G.state===GameState.HOUSE&&G.house){
+    const inst=G.house;
+    if(inst.trigger&&!inst.trigger.used&&(faction().purpleSense||G.night||dist2(p.x,p.y,inst.trigger.x,inst.trigger.y)<5.5))
+      put("◆",Math.atan2(inst.trigger.y-p.y,inst.trigger.x-p.x),COL.purple,true);
+    if(inst.cluesFound>=3&&inst.curse>=CurseState.SEAL&&inst.curse<CurseState.RESOLVED)
+      put("●",Math.atan2(inst.ward.y-p.y,inst.ward.x-p.x),COL.green,true);
+    if(inst.monster&&inst.curse!==CurseState.DISTORTION&&dist2(p.x,p.y,inst.monster.x,inst.monster.y)<7)
+      put("▲",Math.atan2(inst.monster.y-p.y,inst.monster.x-p.x),COL.red,true);
+  } else if(G.state===GameState.WORLD){
+    for(const [ch,d] of Object.entries(VILLAGE.doors)){
+      if(ch==="S"){put("⌂",Math.atan2(d.r+0.5-p.y,d.c+0.5-p.x),COL.green,true);continue;}
+      const inst=G.houseInst[+ch-1];
+      put(ch,Math.atan2(d.r+0.5-p.y,d.c+0.5-p.x),inst&&inst.resolved?COL.green:COL.purple,true);
+    }
+  }
+}
+function objective(inst){
+  switch(inst.curse){
+    case CurseState.DORMANT:return inst.trigger.used?"":"scavenge — the purple object waits";
+    case CurseState.OMEN:return"something stirs… clues revealed";
+    case CurseState.SEAL:return"find "+(3-inst.cluesFound)+" clue(s) — blue lights";
+    case CurseState.HUNT:return inst.cluesFound<3?"survive · clues "+inst.cluesFound+"/3":"reach the GREEN ward — press E";
+    case CurseState.DISTORTION:return inst.cluesFound<3?"the house lies · clues "+inst.cluesFound+"/3":"reach the GREEN ward — press E";
+    case CurseState.JUDGMENT:return"HOLD THE RITE";
+    case CurseState.RESOLVED:return"the exit is open";
+  }
+  return"";
+}
+
+/* ---------- map + journal overlays ---------- */
+function renderMapOverlay(){
+  ctx.fillStyle="rgba(3,2,8,.9)";ctx.fillRect(70,60,W-140,H-140);
+  ctx.strokeStyle="rgba(180,160,255,.4)";ctx.strokeRect(70,60,W-140,H-140);
+  ctx.textAlign="center";ctx.font="bold 14px monospace";ctx.fillStyle=COL.bone;
+  const distorted=G.state===GameState.HOUSE&&G.house&&G.house.curse===CurseState.DISTORTION;
+  ctx.fillText(distorted?"FIELD MAP — THE MAP LIES":"FIELD MAP",W/2,82);
+  const p=G.player;
+  if(G.state===GameState.HOUSE&&G.house){
+    const inst=G.house,sc=26,ox=W/2-HCOLS*sc/2,oy=104;
+    for(let r=0;r<HROWS;r++)for(let c=0;c<HCOLS;c++){
+      let x=ox+c*sc,y=oy+r*sc;
+      if(distorted){x+=Math.sin(hash2(c,r)+G.time*2)*5;y+=Math.cos(hash2(r,c)+G.time*2)*5;}
+      ctx.fillStyle=isSolid(c,r)?"#3a3a5c":"#14141f";
+      ctx.fillRect(x,y,sc-1,sc-1);
+    }
+    const mk=(mx,my,col)=>{ctx.fillStyle=col;ctx.beginPath();ctx.arc(ox+mx*sc,oy+my*sc,4,0,7);ctx.fill();};
+    if(inst.ward)mk(inst.ward.x,inst.ward.y,COL.green);
+    if(inst.trigger&&!inst.trigger.used)mk(inst.trigger.x,inst.trigger.y,COL.purple);
+    if(inst.curse>=CurseState.OMEN)for(const cl of inst.clues)if(!cl.taken)mk(cl.x,cl.y,COL.blue);
+    if(inst.monster&&!distorted)mk(inst.monster.x,inst.monster.y,COL.red);
+    /* player arrow */
+    ctx.save();ctx.translate(ox+p.x*sc,oy+p.y*sc);ctx.rotate(p.dir);
+    ctx.fillStyle="#fff";ctx.beginPath();ctx.moveTo(7,0);ctx.lineTo(-5,4.5);ctx.lineTo(-5,-4.5);ctx.closePath();ctx.fill();ctx.restore();
+    ctx.fillStyle="#999";ctx.font="11px monospace";ctx.textAlign="center";
+    ctx.fillText(inst.def.ritual,W/2,H-96);
+  }else{
+    const sc=12.4,ox=W/2-VW*sc/2,oy=100;
+    for(let r=0;r<VH;r++)for(let c=0;c<VW;c++){
+      const ch=VILLAGE.grid[r][c];
+      if(ch===".")continue;
+      ctx.fillStyle=ch==="#"?"#2c2c3c":(ch==="s"||ch==="S")?"#1f5a35":
+        ("123".includes(ch)?(G.houseInst[+ch-1]&&G.houseInst[+ch-1].resolved?"#1f5a35":"#4a2a6a"):"#3a3048");
+      ctx.fillRect(ox+c*sc,oy+r*sc,sc-0.5,sc-0.5);
+    }
+    ctx.save();ctx.translate(ox+p.x*sc,oy+p.y*sc);ctx.rotate(p.dir);
+    ctx.fillStyle="#fff";ctx.beginPath();ctx.moveTo(7,0);ctx.lineTo(-5,4.5);ctx.lineTo(-5,-4.5);ctx.closePath();ctx.fill();ctx.restore();
+    ctx.fillStyle="#999";ctx.font="11px monospace";ctx.textAlign="center";
+    ctx.fillText("Purple houses hold unresolved curses. Green are safe.",W/2,H-96);
+  }
+}
+function renderJournal(){
+  ctx.fillStyle="rgba(6,4,10,.92)";ctx.fillRect(120,60,W-240,H-140);
+  ctx.strokeStyle="rgba(120,170,255,.4)";ctx.strokeRect(120,60,W-240,H-140);
+  ctx.textAlign="center";ctx.font="bold 15px serif";ctx.fillStyle=COL.blue;
+  ctx.fillText("FIELD JOURNAL — EVIDENCE",W/2,86);
+  ctx.textAlign="left";let y=112;
+  for(let i=0;i<3;i++){
+    const def=HOUSES[i],inst=G.houseInst[i];
+    ctx.font="bold 13px serif";
+    ctx.fillStyle=inst&&inst.resolved?COL.green:COL.bone;
+    ctx.fillText((inst&&inst.resolved?"✓ ":"· ")+def.name+" — "+def.curseType,142,y);y+=17;
+    ctx.font="11px monospace";
+    if(!inst){ctx.fillStyle="#666";ctx.fillText("   (not yet entered)",142,y);y+=15;}
+    else{
+      let any=false;
+      for(const cl of inst.clues)if(cl.taken&&!cl.fake){
+        ctx.fillStyle=COL.blue;ctx.fillText("   • "+def.clueTexts[cl.idx],142,y);y+=15;any=true;}
+      if(!any){ctx.fillStyle="#666";ctx.fillText("   (no evidence collected)",142,y);y+=15;}
+      if(inst.cluesFound>=3&&!inst.resolved){ctx.fillStyle=COL.green;ctx.fillText("   → "+def.ritual,142,y);y+=15;}
+    }
+    y+=10;
+  }
+  ctx.fillStyle="#777";ctx.font="10px monospace";ctx.textAlign="center";
+  ctx.fillText("Bullets stagger. Knowledge resolves. — press J to close",W/2,H-96);
+}
+
+/* ---------- title & end ---------- */
+function renderTitle(){
+  G.time+=1/60;
+  const pulse=0.5+0.5*Math.sin(G.time*2);
+  ctx.fillStyle="#04040a";ctx.fillRect(0,0,W,H);
+  /* fog banks */
+  for(let i=0;i<5;i++){
+    const y=340+i*40,off=(G.time*(8+i*3))%(W+400)-200;
+    ctx.fillStyle="rgba(60,45,90,"+(0.05+i*0.012)+")";
+    ctx.beginPath();ctx.ellipse(off,y,240,26,0,0,7);ctx.fill();
+  }
+  for(let i=0;i<50;i++){const h=hash2(i,9);
+    ctx.fillStyle="rgba(255,255,255,"+(0.05+(h%40)/400)+")";
+    ctx.fillRect(h%W,(h>>4)%240,1.4,1.4);}
+  /* house silhouette */
+  const hg=ctx.createRadialGradient(W/2,200,20,W/2,200,190);
+  hg.addColorStop(0,"rgba(150,70,255,"+(0.14+0.08*pulse)+")");hg.addColorStop(1,"rgba(0,0,0,0)");
+  ctx.fillStyle=hg;ctx.fillRect(W/2-200,10,400,380);
+  ctx.fillStyle="#0d0d16";ctx.fillRect(W/2-90,150,180,110);
+  ctx.beginPath();ctx.moveTo(W/2-108,152);ctx.lineTo(W/2,92);ctx.lineTo(W/2+108,152);ctx.closePath();
+  ctx.fillStyle="#12121e";ctx.fill();
+  ctx.fillStyle="rgba(176,96,255,"+(0.45+0.45*pulse)+")";
+  ctx.fillRect(W/2-58,175,24,28);ctx.fillRect(W/2+34,175,24,28);
+  ctx.fillStyle="#1c1208";ctx.fillRect(W/2-14,215,28,45);
+  /* something stands in the doorway */
+  ctx.fillStyle="rgba(5,5,8,"+(0.5+0.5*pulse)+")";
+  ctx.fillRect(W/2-5,222,10,38);
+  ctx.fillStyle="rgba(207,199,184,"+(0.5+0.5*pulse)+")";
+  ctx.beginPath();ctx.ellipse(W/2,226,3.5,4.5,0,0,7);ctx.fill();
+
+  ctx.textAlign="center";
+  ctx.fillStyle=COL.bone;ctx.font="bold 44px serif";
+  ctx.shadowColor=COL.purple;ctx.shadowBlur=28;
+  ctx.fillText("CURSEBOUND",W/2,318);ctx.shadowBlur=0;
+  ctx.font="16px serif";ctx.fillStyle="#b8a8d8";
+  ctx.fillText("— Houses of the Ancients · 3D test 1 —",W/2,344);
+  ctx.font="12px monospace";ctx.fillStyle="#888";
+  ctx.fillText("First person. One flashlight. Three houses that remember.",W/2,366);
+
+  const cw=272,gap=18,x0=W/2-(cw*3+gap*2)/2;
+  for(let i=0;i<3;i++){
+    const f=FACTIONS[i],x=x0+i*(cw+gap),y=392,hh=138,sel=G.factionIdx===i;
+    ctx.fillStyle=sel?"rgba(28,24,48,.95)":"rgba(12,12,22,.9)";
+    ctx.fillRect(x,y,cw,hh);
+    ctx.strokeStyle=sel?f.color:"rgba(120,120,150,.35)";ctx.lineWidth=sel?2.5:1;
+    ctx.strokeRect(x,y,cw,hh);
+    ctx.fillStyle=f.color;ctx.font="bold 13px monospace";
+    ctx.fillText("["+(i+1)+"] "+f.name.split("·")[0].trim(),x+cw/2,y+22);
+    ctx.fillStyle="#a8a8bc";ctx.font="10px monospace";
+    ctx.fillText(f.name.split("·")[1].trim(),x+cw/2,y+38);
+    ctx.fillStyle="#c8c8d8";
+    f.desc.forEach((d,j)=>ctx.fillText(d,x+cw/2,y+60+j*16));
+    ctx.fillStyle="#666";ctx.fillText("affinity: "+HOUSES.find(h=>h.affinity===f.key).name,x+cw/2,y+hh-10);
+  }
+  ctx.fillStyle="rgba(240,234,216,"+(0.6+0.4*pulse)+")";ctx.font="bold 14px monospace";
+  ctx.fillText("1 / 2 / 3 choose your order · CLICK to enter the zone (captures mouse)",W/2,562);
+  ctx.fillStyle="#555";ctx.font="10px monospace";
+  ctx.fillText("WASD move · mouse look · click/space shoot · E interact · F light · N night · M map · J journal · R restart",W/2,584);
+}
+function renderEnd(title,body,color){
+  ctx.fillStyle="rgba(2,2,8,.82)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle=color;ctx.font="bold 36px serif";
+  ctx.shadowColor=color;ctx.shadowBlur=22;
+  ctx.fillText(title,W/2,240);ctx.shadowBlur=0;
+  ctx.fillStyle=COL.bone;ctx.font="14px monospace";
+  ctx.fillText(body,W/2,288);
+  ctx.fillStyle="#aaa";ctx.font="12px monospace";
+  ctx.fillText("Houses resolved: "+G.resolvedCount+"/3 · clues: "+G.stats.clues+" · shots: "+G.stats.shots+" · mimics met: "+G.stats.mimics,W/2,324);
+  ctx.fillStyle="rgba(255,255,255,"+(0.5+0.5*Math.sin(G.time*3))+")";ctx.font="bold 14px monospace";
+  ctx.fillText("Press R to return to the title",W/2,372);
+}
+
+/* ------------------------------ render ----------------------------- */
+function render(){
+  if(G.state===GameState.TITLE){renderTitle();return;}
+  renderScene();
+  renderHands();
+  renderPost();
+  renderHUD();
+  if(G.showMap)renderMapOverlay();
+  if(G.showJournal)renderJournal();
+  if(G.state===GameState.GAME_OVER)renderEnd("THE HOUSE KEEPS YOU",G.overCause,COL.red);
+  if(G.state===GameState.WIN)renderEnd("THE ZONE GOES QUIET","All three curses resolved. The ancients close their eyes — for now.",COL.green);
+}
+
+/* ------------------------------ loop ------------------------------- */
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000);last=now;
+  if(G.state!==GameState.TITLE)update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* -------- sanity checks on data (console only) -------- */
+(function validate(){
+  for(const hDef of HOUSES){
+    if(hDef.map.length!==HROWS)console.warn(hDef.name,"bad row count");
+    hDef.map.forEach((r,i)=>{if(r.length!==HCOLS)console.warn(hDef.name,"row",i,"len",r.length);});
+    const flat=hDef.map.join(""),count=ch=>flat.split(ch).length-1;
+    if(count("C")!==3)console.warn(hDef.name,"clue count",count("C"));
+    ["T","W","M","D"].forEach(ch=>{if(count(ch)!==1)console.warn(hDef.name,"marker",ch,count(ch));});
+  }
+  VILLAGE.grid.forEach((row,i)=>{if(row.length!==VW)console.warn("village row",i,"len",row.length);});
+})();
+</script>
+</body>
+</html>

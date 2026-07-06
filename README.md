@@ -7,6 +7,11 @@ loot cache and a cursed crime scene.
 **Play it:** open `index.html` in any modern browser. One self-contained file — no
 libraries, no external assets, everything drawn with Canvas shapes, text, and glow effects.
 
+**3D version:** open `3d index test 1.html` for a first-person raycast build of the same
+game — procedural wall textures, sprite monsters unique to each house, pointer-lock mouse
+look, a drawn revolver + torch viewmodel, heartbeat/drone audio, jump scares, film grain,
+and a field journal (J). Same rules, scarier room.
+
 ## The loop
 
 1. Pick a faction on the title screen (Celtic, Assyrian, or Egyptian — each has a passive).
