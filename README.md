@@ -26,6 +26,14 @@ perspective-correct textured floors and ceilings cast per pixel: worn stained fl
 under dark plank ceilings indoors, mossy dirt ground outdoors. Adds footsteps and
 cross-braced village timberwork. Same gameplay, gallery included.
 
+**True 3D build:** open `3d index test 4.html` for real polygonal 3D — a from-scratch WebGL
+renderer (no libraries): every asset box-modeled Blender-style from the bible's sheets
+(monsters, exorcists, crates, chests, triggers, ward stones), the bible's painted textures
+on a generated atlas wrapping real geometry, a true free-look camera (no shear tricks),
+a torch that casts a real spotlight, voxels for dust, ground fog, falling leaves, grass and
+wriggling leeches on the danger path — and a revolver viewmodel that points forward down
+the barrel. **V** opens a 3D turntable gallery of every model.
+
 ## The loop
 
 1. Pick a faction on the title screen (Celtic, Assyrian, or Egyptian — each has a passive).
